@@ -1,0 +1,8 @@
+switch close player, back to chat.
+remove new assessment near to view dashboard
+pdf viewer bug
+duplicate view dashboard
+continue convo after back to chat about the pdf
+code clean up
+one liner about patient
+disable chat type when agent processing
