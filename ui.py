@@ -180,6 +180,24 @@ st.markdown("""
         border-left-color: #DC3545 !important;
         color: #000000 !important;
     }
+    
+    /* Prevent ghost/blur rendering during state transitions */
+    .stChatMessage {
+        transition: none !important;
+        will-change: auto !important;
+    }
+    
+    /* Ensure clean section rendering */
+    .element-container {
+        isolation: isolate;
+    }
+    
+    /* Fix blurry text during spinner/loading states */
+    .stSpinner {
+        position: relative;
+        z-index: 100;
+        background: white;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -209,7 +227,7 @@ try:
         AWS_REGION = config.get("aws_region", "us-east-1")
         BUCKET_NAME = config.get("s3_bucket", "aps-summarization-poc")
         AGENT_ID = config.get("bedrock_agent_id", "7TGNDBPOHR")  # Managing Agent
-        AGENT_ALIAS_ID = config.get("bedrock_agent_alias_id", "H3JJW6FLBC")  # Updated alias
+        AGENT_ALIAS_ID = config.get("bedrock_agent_alias_id", "PZS6QFL7BA")  # Updated alias
         
         # Create a session with the specified profile
         boto_session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
@@ -218,7 +236,10 @@ try:
         s3_client = boto_session.client("s3")
         bedrock_agent_client = boto_session.client(
             "bedrock-agent-runtime",
-            config=Config(read_timeout=900)  # 15 min timeout for long-running agent
+            config=Config(
+                read_timeout=1200,  # 20 min timeout for long-running agent (6-step pipeline)
+                connect_timeout=60
+            )
         )
         bedrock_agent_mgmt_client = boto_session.client("bedrock-agent")
 
@@ -229,14 +250,17 @@ try:
         AWS_REGION = "us-east-1"
         BUCKET_NAME = "aps-summarization-poc"
         AGENT_ID = "7TGNDBPOHR"  # Managing Agent
-        AGENT_ALIAS_ID = "H3JJW6FLBC"  # Updated alias
+        AGENT_ALIAS_ID = "PZS6QFL7BA"  # Updated alias
         
         # Create clients with default credentials
         s3_client = boto3.client("s3", region_name=AWS_REGION)
         bedrock_agent_client = boto3.client(
             "bedrock-agent-runtime",
             region_name=AWS_REGION,
-            config=Config(read_timeout=900)
+            config=Config(
+                read_timeout=1200,  # 20 min timeout for long-running agent (6-step pipeline)
+                connect_timeout=60
+            )
         )
         bedrock_agent_mgmt_client = boto3.client("bedrock-agent", region_name=AWS_REGION)
     
@@ -249,7 +273,7 @@ except Exception as e:
     AWS_REGION = "us-east-1"
     BUCKET_NAME = "aps-summarization-poc"
     AGENT_ID = "7TGNDBPOHR"  # Managing Agent (fallback)
-    AGENT_ALIAS_ID = "H3JJW6FLBC"  # Updated alias (fallback)
+    AGENT_ALIAS_ID = "PZS6QFL7BA"  # Updated alias (fallback)
 
 # =========================================================
 # PIPELINE STEPS (6 Steps - maps to 6 Lambda functions)
@@ -723,7 +747,7 @@ def highlight_risk_terms(text: str, high_terms=None, moderate_terms=None, low_te
     
     return pattern.sub(repl, escaped)
 
-def render_colored_summary(summary_text, title="", show_bullets=False, key_points=None, high_risk_terms=None,moderate_risk_terms=None, low_risk_terms=None, risk_level=None):
+def render_colored_summary(summary_text, title="", show_bullets=False, key_points=None, high_risk_terms=None,moderate_risk_terms=None, low_risk_terms=None, risk_level=None, keyword_source="narrative_summary"):
     """
     Render summary with color coding based on LLM-generated risk level.
     
@@ -736,6 +760,7 @@ def render_colored_summary(summary_text, title="", show_bullets=False, key_point
         moderate_risk_terms: Terms to highlight in orange (optional override)
         low_risk_terms: Terms to highlight in green (optional override)
         risk_level: Risk level for border color (optional override, defaults to executive_summary.risk_level)
+        keyword_source: Which keyword field to use - "narrative_summary" or "risk_assessment" (default: "narrative_summary")
     
     Returns:
         None (renders directly to Streamlit)
@@ -754,17 +779,41 @@ def render_colored_summary(summary_text, title="", show_bullets=False, key_point
     # Get keywords from executive_summary if not provided
     if st.session_state.final_data and (high_risk_terms is None or moderate_risk_terms is None or low_risk_terms is None):
         exec_summary = st.session_state.final_data.get("executive_summary", {})
-        rl_keywords = exec_summary.get("risk_level_keywords", {}) or {}
+        
+        # Select keyword source based on parameter
+        if keyword_source == "risk_assessment":
+            # Use risk_assessment_keywords for Risk Assessment section
+            rl_keywords = exec_summary.get("risk_assessment_keywords", {}) or {}
+        else:
+            # Use narrative_summary_keywords for Summary section (default)
+            rl_keywords = exec_summary.get("narrative_summary_keywords", {}) or {}
+        
         high_risk_terms = high_risk_terms or (rl_keywords.get("high") or [])
         moderate_risk_terms = moderate_risk_terms or (rl_keywords.get("moderate") or [])
         low_risk_terms = low_risk_terms or (rl_keywords.get("low") or [])
     
+    # CRITICAL: Only highlight keywords matching the overall risk level
+    # This prevents confusion - if risk is HIGH, only show red highlights, not orange/green
+    filtered_high_terms = []
+    filtered_moderate_terms = []
+    filtered_low_terms = []
+    
+    if risk_level == "high":
+        # Only highlight high-risk keywords (red)
+        filtered_high_terms = high_risk_terms
+    elif risk_level == "moderate":
+        # Only highlight moderate-risk keywords (orange)
+        filtered_moderate_terms = moderate_risk_terms
+    else:  # risk_level == "low"
+        # Only highlight low-risk keywords (green)
+        filtered_low_terms = low_risk_terms
+    
     # Highlight keywords inline in summary text
     highlighted = highlight_risk_terms(
         summary_text,
-        high_terms=high_risk_terms,
-        moderate_terms=moderate_risk_terms,
-        low_terms=low_risk_terms,
+        high_terms=filtered_high_terms,
+        moderate_terms=filtered_moderate_terms,
+        low_terms=filtered_low_terms,
     )
     
     # Add title as HTML bold if provided (after keyword highlighting to avoid escaping)
@@ -2720,14 +2769,18 @@ with st.sidebar:
     # if st.session_state.session_id:
     #     st.success(f"**Session:** `{st.session_state.session_id[:8]}...`")
     
-    # PDF Viewer Toggle (only shown when dashboard is displayed)
+    # Back to Chat Button (only shown when dashboard is displayed)
     if st.session_state.final_data and st.session_state.show_dashboard:
-        # Use callback to ensure state updates before rerun
-        def toggle_pdf_viewer():
-            st.session_state.pdf_viewer_visible = not st.session_state.pdf_viewer_visible
+        if st.button("⬅️ Back to Chat", key="back_to_chat_sidebar", use_container_width=True):
+            st.session_state.show_dashboard = False
+            st.session_state.agent_completed = False
+            st.session_state.agent_running = False
+            # Preserve conversation state when returning to chat
+            if not st.session_state.conversation_active:
+                st.session_state.conversation_active = True
+            st.rerun()
         
-        button_text = "◀ Close Viewer" if st.session_state.pdf_viewer_visible else "📄 Open Viewer"
-        st.button(button_text, key="toggle_viewer_sidebar", width='stretch', on_click=toggle_pdf_viewer)
+        st.markdown("---")
     
     # Navigation (only shown when dashboard is displayed)
     if st.session_state.final_data and st.session_state.show_dashboard:
@@ -2745,10 +2798,14 @@ with st.sidebar:
             ],
             key="dashboard_section"
         )
-            
-    if st.button("🔄 New Assessment"):
-        reset_session()
-        st.rerun()
+    
+    # New Assessment Button (only shown when a session is active)
+    # Hidden during upload and initial state to prevent accidental resets
+    if st.session_state.uploaded:
+        st.markdown("---")
+        if st.button("🔄 New Assessment", use_container_width=True):
+            reset_session()
+            st.rerun()
 
 # =========================================================
 # UPLOAD SECTION
@@ -2803,7 +2860,6 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
     with st.expander("📄 Document Information", expanded=False):
         st.info(f"**PDF Ready:** {st.session_state.uploaded_file_name}")
         st.info(f"**Session ID:** `{st.session_state.session_id}`")
-        st.caption(f"🔧 Debug: Using Agent ID: `{AGENT_ID}` | Alias: `{AGENT_ALIAS_ID}`")
     
     st.markdown("---")
     
@@ -2818,12 +2874,22 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
                 elif message["role"] == "assistant":
                     # Show agent badge
                     if message.get("agent"):
-                        agent_type = "summarization" if "Summarization" in message["agent"] else "processing"
-                        badge_color = "#0066CC" if agent_type == "summarization" else "#ED8B00"
+                        # Determine agent type and color based on agent name
+                        agent_name = message["agent"]
+                        if "Summarization" in agent_name:
+                            agent_type = "summarization"
+                            badge_color = "#0066CC"  # Blue for Summarization Agent
+                        elif "Processing" in agent_name:
+                            agent_type = "processing"
+                            badge_color = "#9B59B6"  # Purple for Processing Agent
+                        else:
+                            agent_type = "managing"
+                            badge_color = "#ED8B00"  # Orange for Managing Agent
+                        
                         st.markdown(
                             f'<div style="background: {badge_color}; color: white; padding: 0.3rem 0.6rem; '
                             f'border-radius: 0.8rem; font-size: 0.7rem; font-weight: 600; display: inline-block; '
-                            f'margin-bottom: 0.5rem;">🤖 {message["agent"]}</div>',
+                            f'margin-bottom: 0.5rem;">🤖 {agent_name}</div>',
                             unsafe_allow_html=True
                         )
                     st.markdown(message["content"])
@@ -2836,6 +2902,26 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
     if st.session_state.quick_action_selected:
         user_prompt = st.session_state.quick_action_selected
         st.session_state.quick_action_selected = None
+        
+        # Clean up old S3 outputs if retrying after error (prevents stale crosses in progress bar)
+        if st.session_state.agent_error is not None:
+            logger.info("Cleaning up old S3 outputs from previous failed attempt")
+            try:
+                # Delete old output files to prevent validation from showing stale "failed" status
+                output_prefix = f"{st.session_state.session_id}/outputs/"
+                delete_response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=output_prefix)
+                if 'Contents' in delete_response:
+                    for obj in delete_response['Contents']:
+                        s3_client.delete_object(Bucket=BUCKET_NAME, Key=obj['Key'])
+                        logger.info(f"Deleted old output: {obj['Key']}")
+            except Exception as e:
+                logger.warning(f"Could not clean old S3 outputs: {e}")
+        
+        # Reset agent state for new request (clear old errors/progress)
+        st.session_state.agent_error = None
+        st.session_state.agent_completed = False
+        st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
+        st.session_state.current_step = 0
         
         # Add to chat history
         st.session_state.chat_messages.append({
@@ -2857,7 +2943,27 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
         disabled=st.session_state.agent_running  # Disable input during processing
     )
     
-    if user_input:
+    if user_input and not st.session_state.agent_running:
+        # Clean up old S3 outputs if retrying after error (prevents stale crosses in progress bar)
+        if st.session_state.agent_error is not None:
+            logger.info("Cleaning up old S3 outputs from previous failed attempt")
+            try:
+                # Delete old output files to prevent validation from showing stale "failed" status
+                output_prefix = f"{st.session_state.session_id}/outputs/"
+                delete_response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=output_prefix)
+                if 'Contents' in delete_response:
+                    for obj in delete_response['Contents']:
+                        s3_client.delete_object(Bucket=BUCKET_NAME, Key=obj['Key'])
+                        logger.info(f"Deleted old output: {obj['Key']}")
+            except Exception as e:
+                logger.warning(f"Could not clean old S3 outputs: {e}")
+        
+        # Reset agent state for new request (clear old errors/progress)
+        st.session_state.agent_error = None
+        st.session_state.agent_completed = False
+        st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
+        st.session_state.current_step = 0
+        
         # Add user message to chat history
         st.session_state.chat_messages.append({
             "role": "user",
@@ -2878,17 +2984,17 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
         
         with col1:
             if st.button("📋 Comprehensive Summary", use_container_width=True, help="Generate complete medical analysis with risk assessment", key="quick_1"):
-                st.session_state.quick_action_selected = "Please analyze this APS document and provide a comprehensive medical summary with risk assessment for underwriting purposes."
+                st.session_state.quick_action_selected = "Analyze this APS document and provide a comprehensive medical summary"
                 st.rerun()
         
         with col2:
             if st.button("⚠️ Identify Risk Factors", use_container_width=True, help="Extract high-risk conditions and medications", key="quick_2"):
-                st.session_state.quick_action_selected = "Please identify all high-risk medical conditions, chronic diseases, and concerning medications in this APS."
+                st.session_state.quick_action_selected = "Analyze this document and identify all risk factors"
                 st.rerun()
         
         with col3:
             if st.button("🧬 Extract Medical Codes", use_container_width=True, help="Get ICD-10 and SNOMED-CT codes", key="quick_3"):
-                st.session_state.quick_action_selected = "Please extract all medical conditions and assign appropriate ICD-10 and SNOMED-CT codes."
+                st.session_state.quick_action_selected = "Extract medical codes from this APS document"
                 st.rerun()
     
     # Show dashboard button if results are available (after summarization completes)
@@ -2897,15 +3003,30 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
         st.markdown("### 🎯 Next Steps")
         st.caption("View the complete analysis dashboard or continue the conversation")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📊 View Full Dashboard", type="primary", use_container_width=True, key="dash_from_chat"):
-                st.session_state.show_dashboard = True
-                st.rerun()
-        with col2:
-            if st.button("🔄 New Document", type="secondary", use_container_width=True, key="new_from_chat"):
-                reset_session()
-                st.rerun()
+        if st.button("📊 View Full Dashboard", type="primary", use_container_width=True, key="dash_from_chat"):
+            st.session_state.show_dashboard = True
+            
+            # Load PDF if not already loaded
+            if not st.session_state.get("pdf_bytes"):
+                with st.spinner("📄 Loading PDF..."):
+                    try:
+                        pdf_bytes = load_pdf_from_s3(
+                            st.session_state.session_id,
+                            BUCKET_NAME,
+                            s3_client
+                        )
+                        if pdf_bytes:
+                            st.session_state.pdf_bytes = pdf_bytes
+                            st.session_state.pdf_page = 1
+                            logger.info("PDF loaded successfully for viewer")
+                        else:
+                            logger.warning("PDF could not be loaded from S3")
+                            st.session_state.pdf_bytes = None
+                    except Exception as e:
+                        logger.error(f"Error loading PDF from chat view: {e}")
+                        st.session_state.pdf_bytes = None
+            
+            st.rerun()
     
     # Stop here to prevent further rendering while waiting for submission
     st.stop()
@@ -2918,25 +3039,40 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
     # Display header
     st.header("💬 APS Analysis Chat")
     
-    # Show full conversation history INCLUDING current message
-    for message in st.session_state.chat_messages:
+    # Show FULL conversation history (static, not blurred)
+    # Display all previous messages normally (not in processing state)
+    for message in st.session_state.chat_messages[:-1]:  # All except last (being processed)
         with st.chat_message(message["role"]):
             if message["role"] == "system":
                 st.info(message["content"])
             elif message["role"] == "assistant":
                 # Show agent badge
                 if message.get("agent"):
-                    agent_type = "summarization" if "Summarization" in message["agent"] else "processing"
-                    badge_color = "#0066CC" if agent_type == "summarization" else "#ED8B00"
+                    # Determine agent type and color based on agent name
+                    agent_name = message["agent"]
+                    if "Summarization" in agent_name:
+                        badge_color = "#0066CC"  # Blue for Summarization Agent
+                    elif "Processing" in agent_name:
+                        badge_color = "#9B59B6"  # Purple for Processing Agent
+                    else:
+                        badge_color = "#ED8B00"  # Orange for Managing Agent
+                    
                     st.markdown(
                         f'<div style="background: {badge_color}; color: white; padding: 0.3rem 0.6rem; '
                         f'border-radius: 0.8rem; font-size: 0.7rem; font-weight: 600; display: inline-block; '
-                        f'margin-bottom: 0.5rem;">🤖 {message["agent"]}</div>',
+                        f'margin-bottom: 0.5rem;">🤖 {agent_name}</div>',
                         unsafe_allow_html=True
                     )
                 st.markdown(message["content"])
             else:  # user message
                 st.markdown(message["content"])
+    
+    # Show current message being processed
+    if st.session_state.chat_messages:
+        current_message = st.session_state.chat_messages[-1]
+        if current_message["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(current_message["content"])
     
     st.markdown("---")
     
@@ -2959,6 +3095,8 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
             
             # Track if we're in summarization mode (will be detected from trace events)
             is_summarization = False
+            # Store in session state so it's available in Loading Results section
+            st.session_state.tools_invoked = False
             
             # Invoke agent with user's natural language prompt
             s3_pdf_path = f"s3://{BUCKET_NAME}/{st.session_state.session_id}/input/{st.session_state.uploaded_file_name}"
@@ -3005,10 +3143,25 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     elif msg["role"] == "assistant" and len(msg.get("content", "")) < 300:
                         conversation_context += f"Assistant: {msg['content']}\n"
             
-            # Append context to user prompt if exists
+            # CRITICAL FIX: Include actual patient data JSON in prompt for follow-up questions
+            # This prevents hallucination by giving the agent access to the actual data
+            json_data_context = ""
+            if st.session_state.final_data:
+                logger.info("Including patient data JSON in agent context to prevent hallucination")
+                # Include complete JSON to ensure agent has all data for answering
+                json_data_context = f"\n\n--- PATIENT DATA (USE THIS TO ANSWER ALL QUESTIONS) ---\n"
+                json_data_context += f"CRITICAL INSTRUCTION: You MUST use ONLY the data below to answer questions. "
+                json_data_context += f"NEVER fabricate or invent information not present in this JSON. "
+                json_data_context += f"If a field shows 'Not specified', 'Unknown', or is empty, you MUST state that explicitly.\n\n"
+                json_data_context += json.dumps(st.session_state.final_data, indent=2)
+                json_data_context += f"\n\n--- END PATIENT DATA ---\n"
+            
+            # Append all context to user prompt
             enhanced_prompt = st.session_state.user_prompt
+            if json_data_context:
+                enhanced_prompt = f"{st.session_state.user_prompt}{json_data_context}"
             if conversation_context:
-                enhanced_prompt = f"{st.session_state.user_prompt}\n{conversation_context}"
+                enhanced_prompt += f"\n{conversation_context}"
             
             response = invoke_bedrock_agent(s3_pdf_path, st.session_state.session_id, enhanced_prompt)
             
@@ -3027,25 +3180,20 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 st.rerun()
                 st.stop()
             
-            # Debug: Log response structure
-            logger.info(f"Response received - Type: {type(response)}")
-            logger.info(f"Response keys: {list(response.keys()) if isinstance(response, dict) else 'Not a dict'}")
-            if 'completion' in response:
-                logger.info(f"Completion field type: {type(response['completion'])}")
-            else:
+            # Debug: Log response structure (reduced verbosity)
+            logger.debug(f"Response received - Type: {type(response)}")
+            logger.debug(f"Response keys: {list(response.keys()) if isinstance(response, dict) else 'Not a dict'}")
+            if 'completion' not in response:
                 logger.warning("⚠️ 'completion' key not found in response!")
             
             # Lock to prevent double invocation on rerun
             st.session_state.agent_running = "started"
             logger.info("Agent invoked successfully, streaming events...")
-            logger.info(f"User request: {st.session_state.user_prompt[:100]}...")
-            logger.info("Waiting to detect agent type from trace events...")
             add_message("📋 Request received - routing to appropriate agent...")
             
             try:
                 event_stream = response.get('completion', [])
-                logger.info(f"Event stream object type: {type(event_stream)}")
-                logger.info("Starting event stream iteration...")
+                logger.debug(f"Event stream object type: {type(event_stream)}")
                 
                 agent_response_text = ""
                 event_count = 0  # Track events for periodic S3 validation
@@ -3054,8 +3202,8 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 for event in event_stream:
                     event_count += 1
                     
-                    # Log every event for debugging (will remove after diagnosis)
-                    logger.info(f"EVENT #{event_count} received - Type: {list(event.keys()) if isinstance(event, dict) else type(event)}")
+                    # Log events at debug level (reduced verbosity)
+                    logger.debug(f"EVENT #{event_count} received - Type: {list(event.keys()) if isinstance(event, dict) else type(event)}")
                     
                     # CRITICAL FIX: If we've received many trace events but no chunks yet,
                     # proactively check S3 to detect if summarization pipeline is running
@@ -3074,6 +3222,7 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                             if file_age_seconds < 120:
                                 # File exists and is fresh! This is summarization mode
                                 is_summarization = True
+                                st.session_state.tools_invoked = True
                                 st.session_state.selected_agent = "APS Summarization Agent"
                                 logger.info(f"🎯 DETECTED: Summarization mode from S3 outputs (file age: {file_age_seconds:.0f}s)")
                                 agent_status_display.success("✅ **Agent Assigned:** APS Summarization Agent")
@@ -3159,6 +3308,7 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                                     # File exists! This confirms we're in summarization mode
                                     if not is_summarization:
                                         is_summarization = True
+                                        st.session_state.tools_invoked = True
                                         logger.info("DETECTED: Summarization mode from S3 outputs - initializing pipeline tracking")
                                         agent_status_display.success("✅ **Current Agent:** Summarization Agent (running 6-step medical analysis)")
                                         tool_display.info("🔧 Detected: **6-Step Medical Analysis Pipeline**")
@@ -3212,11 +3362,29 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                         chunk_lower = chunk_text.lower()
                         
                         # Detect Textract/extraction errors - these indicate summarization mode was attempted
-                        if ("document extraction" in chunk_lower or "textract" in chunk_lower) and \
-                           ("could not be completed" in chunk_lower or "capacity" in chunk_lower or "throughput" in chunk_lower or "limit" in chunk_lower):
+                        # IMPORTANT: Only detect ACTUAL errors, not conversational references to past errors
+                        # Real errors use definitive language: "could not be completed", "failed", "error occurred"
+                        # Conversational references use conditional language: "may have", "when the", "if the"
+                        is_textract_error = False
+                        if "textract" in chunk_lower or "document extraction" in chunk_lower or "text extraction" in chunk_lower:
+                            # Check for definitive error language (not conversational mentions)
+                            if ("could not be completed" in chunk_lower or 
+                                "cannot be completed" in chunk_lower or
+                                "failed" in chunk_lower or
+                                "error occurred" in chunk_lower):
+                                is_textract_error = True
+                            # Exclude conversational references to past errors
+                            elif ("may have resolved" in chunk_lower or 
+                                  "when the capacity" in chunk_lower or
+                                  "if the service" in chunk_lower or
+                                  "try again when" in chunk_lower):
+                                is_textract_error = False
+                        
+                        if is_textract_error:
                             # This is a Textract capacity error - indicates summarization was attempted
                             if not is_summarization:
                                 is_summarization = True
+                                st.session_state.tools_invoked = True
                                 logger.info("DETECTED: Summarization mode from Textract error - pipeline was attempted but failed early")
                                 agent_status_display.success("✅ **Current Agent:** Summarization Agent (pipeline attempted - Textract capacity error)")
                                 # Initialize pipeline tracking
@@ -3308,6 +3476,7 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                                     # Detect summarization mode by checking tool names
                                     if not is_summarization and any(tool in tool_name.lower() for tool in ["extraction", "medical", "icd", "diagnostic", "risk"]):
                                         is_summarization = True
+                                        st.session_state.tools_invoked = True
                                         st.session_state.selected_agent = "APS Summarization Agent"
                                         logger.info("DETECTED: Summarization mode - initializing 6-step pipeline tracking")
                                         agent_status_display.success("✅ **Agent Assigned:** APS Summarization Agent")
@@ -3459,10 +3628,23 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                             if name_match:
                                 patient_name = name_match.group(1)
                         
+                        # Build enhanced status message with risk level if available
+                        doc_status_msg = f"✅ APS analysis complete for **{patient_name}**."
+                        
+                        # Try to add risk level summary if data already loaded
+                        if st.session_state.final_data:
+                            exec_summary = st.session_state.final_data.get("executive_summary", {})
+                            risk_level = exec_summary.get("risk_level", "")
+                            if risk_level:
+                                risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
+                                doc_status_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
+                        
+                        doc_status_msg += " Click **View Dashboard** below to explore the full results."
+                        
                         # Add brief confirmation to chat
                         st.session_state.chat_messages.append({
                             "role": "assistant",
-                            "content": f"✅ I've completed the analysis of the APS document for {patient_name}. Click 'View Dashboard' below to see the detailed results.",
+                            "content": doc_status_msg,
                             "agent": st.session_state.selected_agent or "APS Summarization Agent",
                             "timestamp": datetime.now()
                         })
@@ -3472,10 +3654,17 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                         
                         # For conversational mode: Add full response to chat history
                         if agent_response_text:
+                            # Extract agent name from response if present (e.g., "APS Processing Agent Response")
+                            agent_name = st.session_state.selected_agent or "APS Managing Agent"
+                            if "APS Processing Agent" in agent_response_text or "Processing Agent" in agent_response_text:
+                                agent_name = "APS Processing Agent"
+                            elif "APS Summarization Agent" in agent_response_text or "Summarization Agent" in agent_response_text:
+                                agent_name = "APS Summarization Agent"
+                            
                             st.session_state.chat_messages.append({
                                 "role": "assistant",
                                 "content": agent_response_text,
-                                "agent": st.session_state.selected_agent or "APS Agent",
+                                "agent": agent_name,
                                 "timestamp": datetime.now()
                             })
                 
@@ -3496,14 +3685,6 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 st.session_state.agent_error = error_msg
                 st.session_state.agent_response_text = agent_response_text  # Store partial response
                 
-                # Add error to chat history
-                st.session_state.chat_messages.append({
-                    "role": "assistant",
-                    "content": f"❌ An error occurred during processing:\n\n{error_msg[:300]}\n\nPlease try again or contact support if the issue persists.",
-                    "agent": st.session_state.selected_agent or "System",
-                    "timestamp": datetime.now()
-                })
-                
                 # Detect if this was a summarization request from error message
                 # If error mentions summarization agent CGOEAHZZTT or indicates timeout during processing
                 error_lower = error_msg.lower()
@@ -3521,11 +3702,60 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     logger.info("Validating completed outputs from S3...")
                     validate_pipeline_status_from_s3(st.session_state.session_id)
                     
+                    # Try to load results from S3 to check if we have usable data despite the error
+                    temp_final_data = load_final_summary(st.session_state.session_id)
+                    
+                    if temp_final_data:
+                        # Success! We have data from S3 (Steps 1-5 completed)
+                        # Don't show error - show success message instead
+                        logger.info("✅ Despite timeout, successfully recovered data from S3 (Steps 1-5 complete)")
+                        st.session_state.final_data = temp_final_data
+                        
+                        # Extract patient name for success message
+                        patient_name = "the patient"
+                        exec_summary = temp_final_data.get("executive_summary", {})
+                        if exec_summary.get("patient_name"):
+                            patient_name = exec_summary.get("patient_name")
+                        
+                        # Build success message with risk level
+                        success_msg = f"✅ APS analysis complete for **{patient_name}**."
+                        risk_level = exec_summary.get("risk_level", "")
+                        if risk_level:
+                            risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
+                            success_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
+                        success_msg += " Click **View Dashboard** below to explore the full results."
+                        
+                        # Add success message to chat (not error)
+                        st.session_state.chat_messages.append({
+                            "role": "assistant",
+                            "content": success_msg,
+                            "agent": "APS Summarization Agent",
+                            "timestamp": datetime.now()
+                        })
+                        
+                        # Clear error flag since we recovered successfully
+                        st.session_state.agent_error = None
+                    else:
+                        # Genuine failure - no data in S3
+                        logger.warning("❌ Timeout AND no data in S3 - genuine failure")
+                        st.session_state.chat_messages.append({
+                            "role": "assistant",
+                            "content": f"❌ An error occurred during processing:\n\n{error_msg[:300]}\n\nPlease try again or contact support if the issue persists.",
+                            "agent": st.session_state.selected_agent or "System",
+                            "timestamp": datetime.now()
+                        })
+                    
                     # Update progress display with validated status
                     with progress_container.container():
                         display_pipeline_progress(st.session_state.current_step)
                 else:
-                    logger.info("Non-summarization mode: No pipeline validation needed")
+                    # Non-summarization error - show error message
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": f"❌ An error occurred during processing:\n\n{error_msg[:300]}\n\nPlease try again or contact support if the issue persists.",
+                        "agent": st.session_state.selected_agent or "System",
+                        "timestamp": datetime.now()
+                    })
                 
                 # Mark agent as completed so user can see results
                 st.session_state.agent_completed = True
@@ -3537,11 +3767,14 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 
                 time.sleep(3)
                 st.rerun()
+    
+    # Stop rendering here to prevent chat input from appearing below
+    st.stop()
 
 # =========================================================
 # LOADING RESULTS SECTION
 # =========================================================
-elif st.session_state.agent_completed and st.session_state.final_data is None and not st.session_state.show_dashboard:
+elif st.session_state.agent_completed and not st.session_state.show_dashboard:
     
     st.header("📥 Step 3: Loading Results")
     
@@ -3555,19 +3788,30 @@ elif st.session_state.agent_completed and st.session_state.final_data is None an
     )
     
     if is_conversational:
-        # CRITICAL: Even if detected as conversational, check S3 for summarization outputs
-        # The Managing Agent might have coordinated with Summarization Agent but returned summary directly
-        logger.info("Conversational mode detected - checking S3 for summarization outputs before returning to chat")
+        # OPTIMIZATION: Only check S3 if tools were actually invoked
+        # If no tools invoked (tools_invoked=False), we KNOW it's pure conversational - skip S3 check
+        # This prevents wasteful 12+ second S3 checks on simple greetings/questions
+        tools_were_invoked = st.session_state.get("tools_invoked", False)
         
-        with st.spinner("⏳ Checking for analysis results..."):
-            final_data = load_final_summary(st.session_state.session_id)
+        # Only check S3 if both: tools invoked AND no final_data yet
+        if tools_were_invoked and st.session_state.final_data is None:
+            # Edge case: Managing Agent coordinated with Summarization Agent but returned early
+            # Check S3 to see if analysis outputs were created
+            logger.info("Conversational mode with tool invocation - checking S3 for summarization outputs")
             
-            if final_data:
-                # Found summarization results! Load them and show dashboard button
-                st.session_state.final_data = final_data
-                logger.info("✅ Found summarization results in S3 - dashboard button will be available")
-            else:
-                logger.info("No summarization results found - this was a pure conversational response")
+            with st.spinner("⏳ Checking for analysis results..."):
+                final_data = load_final_summary(st.session_state.session_id)
+                
+                if final_data:
+                    st.session_state.final_data = final_data
+                    logger.info("✅ Found summarization results in S3 - dashboard button will be available")
+                else:
+                    logger.info("No summarization results found - returning to chat")
+        elif st.session_state.final_data is not None:
+            logger.info("final_data already loaded — skipping S3 check")
+        else:
+            # No tools invoked AND no final_data = pure conversational response
+            logger.info("No tools invoked - pure conversational response, skipping S3 check entirely")
         
         # Reset agent state to show chat interface with response already in chat history
         st.session_state.agent_running = False
@@ -3632,9 +3876,10 @@ elif st.session_state.agent_completed and st.session_state.final_data is None an
     
     st.markdown("---")
     
-    # Load summarization results (only for pipeline mode)
-    with st.spinner("⏳ Loading final results..."):
-        final_data = load_final_summary(st.session_state.session_id)
+    # Load summarization results (only for pipeline mode, and only if not already loaded)
+    if st.session_state.final_data is None:
+        with st.spinner("⏳ Loading final results..."):
+            final_data = load_final_summary(st.session_state.session_id)
         
         if final_data:
             st.session_state.final_data = final_data
@@ -3751,100 +3996,60 @@ elif st.session_state.agent_completed and st.session_state.final_data is None an
             
             # Case 4: Previous steps completed but Step 6 failed
             else:
-                # Check if this is a timeout error with partial results available
+                # Check if this is a timeout error
                 is_timeout_error = st.session_state.agent_error and "timed out" in st.session_state.agent_error.lower()
                 
-                if is_timeout_error and (has_step1 and has_step2 and has_step3):
-                    # Timeout occurred but we have Steps 1-3 completed
-                    # Offer to load partial results or retry
-                    st.warning("⏰ **Agent Timeout - Partial Results Available**")
+                if is_timeout_error:
+                    # Timeout occurred - final summary not generated
+                    st.error("⏰ **Analysis Timeout**")
                     st.markdown("""
-                    The Bedrock Agent timed out (5-minute limit exceeded), but the pipeline completed several steps:
+                    The analysis could not be completed within the time limit. The final risk assessment 
+                    and summary (Step 6) require all previous steps to finish successfully.
                     
-                    **✅ Completed:**
-                    - Step 1: Text Extraction
-                    - Step 2: Field Calculation  
-                    - Step 3: Medical Coding
-                    """ + (f"\n    - Step 4: Diagnostic Test Detection" if has_step4 else "") + """
+                    **What happened:**
+                    - The Bedrock Agent timed out before completing the full 6-step pipeline
+                    - The final summary file (`enhanced_medical_summary_with_risks.json`) was not generated
                     
-                    ❌ **Incomplete:** Final risk assessment and summary (Step 6)
-                    
-                    **Options:**
-                    1. **View Partial Results**: See patient info, conditions, and codes from completed steps
-                    2. **Retry Analysis**: Start over to get the complete risk assessment
+                    **Next steps:**
+                    - Click **Retry Analysis** below to start a new analysis
+                    - The increased timeout (20 minutes) should allow more time for processing
                     """)
+                    st.caption("💡 Tip: Larger documents with many pages may require more processing time. The timeout has been increased to accommodate this.")
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("📊 View Partial Dashboard", type="primary", use_container_width=True):
-                            # Try to build partial data from available S3 files
-                            logger.info("User chose to view partial results after timeout")
-                            try:
-                                # Manually load the completed steps
-                                from botocore.exceptions import ClientError
-                                partial_data = {}
-                                
-                                # Load Step 1 output
-                                try:
-                                    response = s3_client.get_object(Bucket=BUCKET_NAME, Key=f"{st.session_state.session_id}/outputs/extracted_text.json")
-                                    partial_data['extracted_text'] = json.loads(response['Body'].read().decode('utf-8'))
-                                except ClientError:
-                                    pass
-                                
-                                # Load Step 2 output
-                                try:
-                                    response = s3_client.get_object(Bucket=BUCKET_NAME, Key=f"{st.session_state.session_id}/outputs/medical_summary.json")
-                                    partial_data['medical_summary'] = json.loads(response['Body'].read().decode('utf-8'))
-                                except ClientError:
-                                    pass
-                                
-                                # Load Step 3 output
-                                try:
-                                    response = s3_client.get_object(Bucket=BUCKET_NAME, Key=f"{st.session_state.session_id}/outputs/coded_conditions.json")
-                                    partial_data['coded_conditions'] = json.loads(response['Body'].read().decode('utf-8'))
-                                except ClientError:
-                                    pass
-                                
-                                # Transform partial data to UI format
-                                medical_summary_data = partial_data.get('medical_summary')
-                                transformed_data = transform_lambda_output_to_ui_format(
-                                    partial_data.get('coded_conditions', {}),
-                                    st.session_state.session_id,
-                                    get_medical_images_from_s3(st.session_state.session_id),
-                                    medical_summary_data
-                                )
-                                
-                                # Add a note that this is partial
-                                if not transformed_data.get('executive_summary'):
-                                    transformed_data['executive_summary'] = {}
-                                transformed_data['executive_summary']['narrative_summary'] = "⚠️ **Partial Analysis** - The complete risk assessment could not be generated due to timeout. The information below is based on partially completed steps."
-                                transformed_data['executive_summary']['overall_risk_assessment'] = "Risk assessment incomplete due to timeout."
-                                
-                                st.session_state.final_data = transformed_data
-                                logger.info("Partial data loaded successfully")
-                                
-                                # Return to chat
-                                st.session_state.agent_running = False
-                                st.session_state.agent_completed = False
-                                st.session_state.conversation_active = True
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed to load partial results: {e}")
-                                logger.error(f"Error loading partial results: {e}")
-                    
-                    with col2:
-                        if st.button("🔄 Retry Analysis", use_container_width=True):
-                            # Reset and retry
-                            st.session_state.agent_completed = False
-                            st.session_state.agent_running = False
-                            st.session_state.agent_error = None
-                            st.session_state.current_step = 0
-                            st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
-                            st.rerun()
+                    if st.button("🔄 Retry Analysis", type="primary", use_container_width=True):
+                        # Clean up old S3 outputs before retry
+                        logger.info("Cleaning up old S3 outputs from previous failed attempt")
+                        try:
+                            output_prefix = f"{st.session_state.session_id}/outputs/"
+                            delete_response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=output_prefix)
+                            if 'Contents' in delete_response:
+                                for obj in delete_response['Contents']:
+                                    s3_client.delete_object(Bucket=BUCKET_NAME, Key=obj['Key'])
+                                    logger.info(f"Deleted old output: {obj['Key']}")
+                        except Exception as e:
+                            logger.warning(f"Could not clean old S3 outputs: {e}")
+                        
+                        # Reset and retry
+                        st.session_state.agent_completed = False
+                        st.session_state.agent_running = False
+                        st.session_state.agent_error = None
+                        st.session_state.current_step = 0
+                        st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
+                        logger.info("User initiated retry after timeout")
+                        st.rerun()
                 else:
                     # Regular Step 6 failure (not timeout)
                     st.error("❌ **Step 6 (Risk Assessment & Summary) failed**")
-                    st.caption("CloudWatch Log: `/aws/lambda/aps-risk-analyzer-and-summary`")
+                    st.markdown("""
+                    The final risk assessment and summary could not be generated. This is the last step 
+                    that combines all previous analysis into the comprehensive dashboard.
+                    
+                    **Possible causes:**
+                    - Lambda function error or timeout
+                    - Data validation issues from previous steps
+                    - S3 write permissions issue
+                    """)
+                    st.caption("📋 CloudWatch Log: `/aws/lambda/aps-risk-analyzer-and-summary`")
                     logger.error("Step 6 failed: No enhanced_medical_summary_with_risks.json found")
             
             if st.button("⬅️ Go Back and Try Again"):
@@ -3855,11 +4060,19 @@ elif st.session_state.agent_completed and st.session_state.final_data is None an
                 st.session_state.current_step = 0
                 st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
                 st.rerun()
+    else:
+        # final_data already exists - this shouldn't normally happen for summarization requests
+        # but handle gracefully by returning to chat
+        logger.info("final_data already loaded in Loading Results section - returning to chat")
+        st.session_state.agent_running = False
+        st.session_state.agent_completed = False
+        st.session_state.conversation_active = True
+        st.rerun()
 
 # =========================================================
 # DASHBOARD BUTTON SECTION
 # =========================================================
-elif st.session_state.final_data and not st.session_state.show_dashboard:
+elif st.session_state.final_data and not st.session_state.show_dashboard and not st.session_state.conversation_active:
     
     st.header("📥 Step 3: Results Ready")
     
@@ -3903,14 +4116,17 @@ elif st.session_state.final_data and not st.session_state.show_dashboard:
 # =========================================================
 elif st.session_state.final_data and st.session_state.show_dashboard:
     
-    # Dashboard header with back button
+    # Dashboard header with PDF viewer toggle
     col1, col2 = st.columns([8, 2])
     with col1:
         st.header("📊 Medical Analysis Dashboard")
     with col2:
-        if st.button("⬅️ Back to Chat", use_container_width=True):
-            st.session_state.show_dashboard = False
-            st.rerun()
+        # PDF Viewer toggle button
+        def toggle_pdf_viewer():
+            st.session_state.pdf_viewer_visible = not st.session_state.pdf_viewer_visible
+        
+        viewer_btn_text = "◀ Close Viewer" if st.session_state.pdf_viewer_visible else "📄 Open Viewer"
+        st.button(viewer_btn_text, key="toggle_viewer_header", use_container_width=True, on_click=toggle_pdf_viewer)
     
     st.markdown("---")
     
@@ -4114,7 +4330,8 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
             key_points = exec_summary.get("key_summary_points", [])
             
             # Display narrative summary with color coding and LLM-generated key points
-            render_colored_summary(summary_text, show_bullets=True, key_points=key_points)
+            # Use narrative_summary_keywords for highlighting
+            render_colored_summary(summary_text, show_bullets=True, key_points=key_points, keyword_source="narrative_summary")
             
             # Add bbox link for the summary text if available in health_history_boxes
             bbox_lookups = data.get("bbox_lookups", {})
@@ -4141,8 +4358,9 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
             st.subheader("⚠️ Risk Assessment")
             
             # Display overall risk assessment from executive_summary with color coding
+            # Use risk_assessment_keywords for highlighting (different from narrative_summary)
             overall_risk = exec_summary.get("overall_risk_assessment", "Risk assessment pending completion.")
-            render_colored_summary(overall_risk, title='Overall Assessment:')
+            render_colored_summary(overall_risk, title='Overall Assessment:', keyword_source="risk_assessment")
             
             # High Risk Analysis - separated by code type
             st.markdown("---")
@@ -4173,7 +4391,12 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                 # Define shared function for hierarchical grouping (used by both SNOMED and RxNorm)
                 def group_hierarchical_for_summary(conditions):
                     """Group conditions by parent code for collapsible display.
-                    Creates parent nodes from hierarchical_path if parent doesn't exist in data."""
+                    Creates parent nodes from hierarchical_path if parent doesn't exist in data.
+                    
+                    Hierarchy depth interpretation:
+                    - depth 0: Standalone (no hierarchical relationship)
+                    - depth 1+: Child of the root parent in hierarchical_path[0]
+                    """
                     groups = {}
                     standalone = []
                     
@@ -4189,25 +4412,21 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                             standalone.append(cond)
                             continue
                         
-                        # If depth 1, it's a parent (root node)
-                        if hierarchy_depth == 1:
-                            parent_code = hierarchical_path[0][0] if hierarchical_path else code
-                            if parent_code not in groups:
-                                groups[parent_code] = {"parent": cond, "children": []}
-                        # If depth > 1, it's a child - find its parent
-                        elif hierarchy_depth > 1 and len(hierarchical_path) > 0:
+                        # If depth >= 1, it's a CHILD of the root parent in hierarchical_path[0]
+                        if hierarchy_depth >= 1 and len(hierarchical_path) > 0:
                             parent_code = hierarchical_path[0][0]  # First node in path is parent
+                            parent_info = hierarchical_path[0]  # [code, name]
+                            
                             if parent_code not in groups:
-                                # Parent not in list yet, create synthetic parent from hierarchical_path
-                                parent_info = hierarchical_path[0]  # [code, name]
+                                # Create synthetic parent from hierarchical_path
                                 synthetic_parent = {
                                     "title": parent_info[1] if len(parent_info) > 1 else "Unknown",
                                     "condition": parent_info[1] if len(parent_info) > 1 else "Unknown",
-                                    "snomed_code": parent_info[0] if cond.get("code_type") == "SNOMED" else "",
+                                    "snomed_code": parent_info[0] if cond.get("code_type") == "SNOMED" or not cond.get("code_type") else "",
                                     "rxnorm_code": parent_info[0] if cond.get("code_type") == "RxNorm" else "",
-                                    "code_type": cond.get("code_type", ""),
+                                    "code_type": cond.get("code_type", "SNOMED"),
                                     "category": cond.get("category", ""),
-                                    "hierarchy_depth": 1,
+                                    "hierarchy_depth": 0,
                                     "hierarchical_path": [parent_info],
                                     "path_display": parent_info[1] if len(parent_info) > 1 else "Unknown",
                                     "evidence_boxes": [],  # No evidence for synthetic parent
@@ -5176,7 +5395,26 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
             
             if vitals_trend and vitals_trend.get("dates"):
                 
-                dates = pd.to_datetime(vitals_trend.get("dates", []))
+                # Filter out invalid dates before parsing and track valid indices
+                raw_dates = vitals_trend.get("dates", [])
+                valid_indices = []
+                valid_dates = []
+                
+                for idx, d in enumerate(raw_dates):
+                    if d and d not in ["Not specified", "N/A", "Unknown", ""]:
+                        valid_indices.append(idx)
+                        valid_dates.append(d)
+                
+                if not valid_dates:
+                    st.info("No valid dates available for vitals trend visualization")
+                    dates = pd.to_datetime([])
+                else:
+                    try:
+                        dates = pd.to_datetime(valid_dates, errors='coerce')
+                    except Exception as e:
+                        logger.error(f"Error parsing vitals dates: {e}")
+                        st.warning(f"Could not parse vitals dates: {e}")
+                        dates = pd.to_datetime([])
                 
                 # Helper function to parse and validate numeric values
                 def parse_numeric_array(values, value_type="value"):
@@ -5242,14 +5480,33 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                 heart_rate_raw = vitals_trend.get("heart_rate", [])
                 bp_raw = vitals_trend.get("bp", [])
                 
+                # Filter raw arrays to match valid date indices
+                def filter_by_valid_indices(arr, valid_indices):
+                    """Keep only elements at valid_indices positions"""
+                    if not arr:
+                        return []
+                    filtered = []
+                    for idx in valid_indices:
+                        if idx < len(arr):
+                            filtered.append(arr[idx])
+                        else:
+                            filtered.append(None)
+                    return filtered
+                
+                weights_raw = filter_by_valid_indices(weights_raw, valid_indices)
+                heart_rate_raw = filter_by_valid_indices(heart_rate_raw, valid_indices)
+                bp_raw = filter_by_valid_indices(bp_raw, valid_indices)
+                
                 # Parse values to numeric or None
                 weights = parse_numeric_array(weights_raw, "weight")
                 heart_rate = parse_numeric_array(heart_rate_raw, "heart_rate")
                 
                 # Handle BP - check if already split into systolic/diastolic or needs parsing
                 if vitals_trend.get("bp_systolic") and vitals_trend.get("bp_diastolic"):
-                    bp_systolic = parse_numeric_array(vitals_trend.get("bp_systolic", []), "bp_systolic")
-                    bp_diastolic = parse_numeric_array(vitals_trend.get("bp_diastolic", []), "bp_diastolic")
+                    bp_systolic_raw = filter_by_valid_indices(vitals_trend.get("bp_systolic", []), valid_indices)
+                    bp_diastolic_raw = filter_by_valid_indices(vitals_trend.get("bp_diastolic", []), valid_indices)
+                    bp_systolic = parse_numeric_array(bp_systolic_raw, "bp_systolic")
+                    bp_diastolic = parse_numeric_array(bp_diastolic_raw, "bp_diastolic")
                 else:
                     bp_systolic, bp_diastolic = parse_bp_array(bp_raw)
                 
@@ -6114,10 +6371,15 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
             
             # Display Chronic Conditions with umbrella grouping
             chronic_conditions_grouped = data.get("chronic_conditions_grouped", {})
-            if chronic_conditions_data:
-                with st.expander(f"🟡 **Chronic Conditions** ({len(chronic_conditions_data)} items)", expanded=True):
-                    # Check if we have grouped data
-                    if chronic_conditions_grouped and chronic_conditions_grouped.get("grouped"):
+            # Determine which data to display and count
+            chronic_display_data = chronic_conditions_data
+            if isinstance(chronic_conditions_grouped, list) and chronic_conditions_grouped:
+                chronic_display_data = chronic_conditions_grouped
+            
+            if chronic_display_data:
+                with st.expander(f"🟡 **Chronic Conditions** ({len(chronic_display_data)} items)", expanded=True):
+                    # Check if we have hierarchical grouped data (dict with "grouped" key)
+                    if isinstance(chronic_conditions_grouped, dict) and chronic_conditions_grouped.get("grouped"):
                         grouped_items = chronic_conditions_grouped["grouped"]
                         ungrouped_items = chronic_conditions_grouped.get("ungrouped", [])
                         
@@ -6139,18 +6401,23 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                             for idx, cond in enumerate(ungrouped_items):
                                 display_condition(cond, idx, "chronic_ungrouped", show_risk_badge=False)
                     else:
-                        # Fallback to non-grouped display
-                        for idx, cond in enumerate(chronic_conditions_data):
+                        # Fallback to flat display (works for both list and non-grouped dict)
+                        for idx, cond in enumerate(chronic_display_data):
                             display_condition(cond, idx, "chronic_cond", show_risk_badge=False)
             
             st.markdown("")  # Spacing
             
             # Display Other Conditions with umbrella grouping
             other_conditions_grouped = data.get("other_conditions_grouped", {})
-            if other_conditions_data:
-                with st.expander(f"🟢 **Other Medical Findings** ({len(other_conditions_data)} items)", expanded=False):
-                    # Check if we have grouped data
-                    if other_conditions_grouped and other_conditions_grouped.get("grouped"):
+            # Determine which data to display and count
+            other_display_data = other_conditions_data
+            if isinstance(other_conditions_grouped, list) and other_conditions_grouped:
+                other_display_data = other_conditions_grouped
+            
+            if other_display_data:
+                with st.expander(f"🟢 **Other Medical Findings** ({len(other_display_data)} items)", expanded=False):
+                    # Check if we have hierarchical grouped data (dict with "grouped" key)
+                    if isinstance(other_conditions_grouped, dict) and other_conditions_grouped.get("grouped"):
                         grouped_items = other_conditions_grouped["grouped"]
                         ungrouped_items = other_conditions_grouped.get("ungrouped", [])
                         
@@ -6172,8 +6439,8 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                             for idx, cond in enumerate(ungrouped_items):
                                 display_condition(cond, idx, "other_ungrouped", show_risk_badge=False)
                     else:
-                        # Fallback to non-grouped display
-                        for idx, cond in enumerate(other_conditions_data):
+                        # Fallback to flat display (works for both list and non-grouped dict)
+                        for idx, cond in enumerate(other_display_data):
                             display_condition(cond, idx, "other_cond", show_risk_badge=False)
             
             st.markdown("")  # Add spacing
@@ -6246,10 +6513,15 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
             
             # Display Other Medications with umbrella grouping
             other_medications_grouped = data.get("other_medications_grouped", {})
-            if other_medications_data:
-                with st.expander(f"💊 **Other Medications** ({len(other_medications_data)} items)", expanded=False):
-                    # Check if we have grouped data
-                    if other_medications_grouped and other_medications_grouped.get("grouped"):
+            # Determine which data to display and count
+            other_meds_display_data = other_medications_data
+            if isinstance(other_medications_grouped, list) and other_medications_grouped:
+                other_meds_display_data = other_medications_grouped
+            
+            if other_meds_display_data:
+                with st.expander(f"💊 **Other Medications** ({len(other_meds_display_data)} items)", expanded=False):
+                    # Check if we have hierarchical grouped data (dict with "grouped" key)
+                    if isinstance(other_medications_grouped, dict) and other_medications_grouped.get("grouped"):
                         grouped_items = other_medications_grouped["grouped"]
                         ungrouped_items = other_medications_grouped.get("ungrouped", [])
                         
@@ -6271,8 +6543,8 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                             for idx, med in enumerate(ungrouped_items):
                                 display_medication(med, idx, "other_med_ungrouped", show_risk_badge=False)
                     else:
-                        # Fallback to non-grouped display
-                        for idx, med in enumerate(other_medications_data):
+                        # Fallback to flat display (works for both list and non-grouped dict)
+                        for idx, med in enumerate(other_meds_display_data):
                             display_medication(med, idx, "other_med", show_risk_badge=False)
             
             st.markdown("")  # Add spacing
@@ -6525,13 +6797,21 @@ elif st.session_state.final_data and st.session_state.show_dashboard:
                     else:
                         encounter_header = ""
                     
-                    # Create visit entry
+                    # Create visit entry with safe date parsing
+                    try:
+                        if appt_date and appt_date not in ["Not specified", "No date", ""]:
+                            sort_date = datetime.strptime(appt_date, "%Y-%m-%d")
+                        else:
+                            sort_date = datetime(9999, 1, 1)  # Far future for sorting
+                    except (ValueError, TypeError):
+                        sort_date = datetime(9999, 1, 1)  # Far future for invalid dates
+                    
                     visits.append({
                         "date": appt_date if appt_date else "No date",
                         "encounter": encounter_header,
                         "description": appt_description,
                         "bboxes": appointment_bboxes,
-                        "sort_date": datetime.strptime(appt_date, "%Y-%m-%d") if appt_date else datetime(9999, 1, 1)
+                        "sort_date": sort_date
                     })
                 
                 # Sort by date (most recent first, pending at end)
