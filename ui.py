@@ -3143,25 +3143,10 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     elif msg["role"] == "assistant" and len(msg.get("content", "")) < 300:
                         conversation_context += f"Assistant: {msg['content']}\n"
             
-            # CRITICAL FIX: Include actual patient data JSON in prompt for follow-up questions
-            # This prevents hallucination by giving the agent access to the actual data
-            json_data_context = ""
-            if st.session_state.final_data:
-                logger.info("Including patient data JSON in agent context to prevent hallucination")
-                # Include complete JSON to ensure agent has all data for answering
-                json_data_context = f"\n\n--- PATIENT DATA (USE THIS TO ANSWER ALL QUESTIONS) ---\n"
-                json_data_context += f"CRITICAL INSTRUCTION: You MUST use ONLY the data below to answer questions. "
-                json_data_context += f"NEVER fabricate or invent information not present in this JSON. "
-                json_data_context += f"If a field shows 'Not specified', 'Unknown', or is empty, you MUST state that explicitly.\n\n"
-                json_data_context += json.dumps(st.session_state.final_data, indent=2)
-                json_data_context += f"\n\n--- END PATIENT DATA ---\n"
-            
-            # Append all context to user prompt
+            # Append context to user prompt if exists
             enhanced_prompt = st.session_state.user_prompt
-            if json_data_context:
-                enhanced_prompt = f"{st.session_state.user_prompt}{json_data_context}"
             if conversation_context:
-                enhanced_prompt += f"\n{conversation_context}"
+                enhanced_prompt = f"{st.session_state.user_prompt}\n{conversation_context}"
             
             response = invoke_bedrock_agent(s3_pdf_path, st.session_state.session_id, enhanced_prompt)
             
