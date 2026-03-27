@@ -227,7 +227,7 @@ try:
         AWS_REGION = config.get("aws_region", "us-east-1")
         BUCKET_NAME = config.get("s3_bucket", "aps-summarization-poc")
         AGENT_ID = config.get("bedrock_agent_id", "7TGNDBPOHR")  # Managing Agent
-        AGENT_ALIAS_ID = config.get("bedrock_agent_alias_id", "PZS6QFL7BA")  # Updated alias
+        AGENT_ALIAS_ID = config.get("bedrock_agent_alias_id", "5TDX9GARMX")  # Updated alias
         
         # Create a session with the specified profile
         boto_session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
@@ -250,7 +250,7 @@ try:
         AWS_REGION = "us-east-1"
         BUCKET_NAME = "aps-summarization-poc"
         AGENT_ID = "7TGNDBPOHR"  # Managing Agent
-        AGENT_ALIAS_ID = "PZS6QFL7BA"  # Updated alias
+        AGENT_ALIAS_ID = "5TDX9GARMX"  # Updated alias
         
         # Create clients with default credentials
         s3_client = boto3.client("s3", region_name=AWS_REGION)
@@ -273,7 +273,7 @@ except Exception as e:
     AWS_REGION = "us-east-1"
     BUCKET_NAME = "aps-summarization-poc"
     AGENT_ID = "7TGNDBPOHR"  # Managing Agent (fallback)
-    AGENT_ALIAS_ID = "PZS6QFL7BA"  # Updated alias (fallback)
+    AGENT_ALIAS_ID = "5TDX9GARMX"  # Updated alias (fallback)
 
 # =========================================================
 # PIPELINE STEPS (6 Steps - maps to 6 Lambda functions)
@@ -299,10 +299,12 @@ STEP_MAP = {
     "field": 2,
     "bmi": 2,
     "section": 2,
+    "medicalsummary": 2,    # MedicalSummaryGenerator → Step 2; must come before "summary"
     "icd": 3,
     "snomed": 3,
     "code": 3,
     "comprehend": 3,
+    "iddiagnostic": 4,      # IdDiagnosticImages → Step 4; must come before "diagnostic"
     "detect": 4,
     "test": 4,
     "image": 4,
@@ -1085,15 +1087,18 @@ def invoke_bedrock_agent(s3_pdf_path, session_id, user_prompt):
         # Don't fail here - some agents might not support status checks
         # The actual invocation will fail if there's a real problem
     
-    # Build prompt with user request FIRST, then document context as "Available Resources"
-    # This allows the agent to see the document info when it needs it, but makes routing decisions
-    # based on the user's actual request, not the presence of document metadata
+    # Build prompt with user request and available resources.
+    # IMPORTANT: Document location and output path are provided as context references ONLY.
+    # The agent must decide the correct mode based on the user's request, NOT on the presence
+    # of a document path. A document path does NOT mean the agent should analyze the document.
     agent_prompt = f"""User Request: {user_prompt}
 
---- Available Resources (for your reference if needed) ---
+--- Session Context (reference only — do NOT use to determine mode) ---
 Document Location: {s3_pdf_path}
 Session ID: {session_id}
-Output Path: s3://{BUCKET_NAME}/{session_id}/outputs/"""
+Output Path: s3://{BUCKET_NAME}/{session_id}/outputs/
+
+IMPORTANT: Base your MODE selection solely on what the user asked. If the user asked a general knowledge question (not about the patient or document), use MODE 1 regardless of the document location above."""
     
     logger.info(f"Invoking Managing Agent (ID: {AGENT_ID})")
     logger.info(f"Session ID: {session_id}")
@@ -2903,8 +2908,9 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
         user_prompt = st.session_state.quick_action_selected
         st.session_state.quick_action_selected = None
         
-        # Clean up old S3 outputs if retrying after error (prevents stale crosses in progress bar)
-        if st.session_state.agent_error is not None:
+        # Clean up old S3 outputs ONLY if retrying after a pipeline failure
+        # (NOT after transient API errors on query-tool calls where pipeline already succeeded)
+        if st.session_state.agent_error is not None and st.session_state.final_data is None:
             logger.info("Cleaning up old S3 outputs from previous failed attempt")
             try:
                 # Delete old output files to prevent validation from showing stale "failed" status
@@ -2916,6 +2922,8 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
                         logger.info(f"Deleted old output: {obj['Key']}")
             except Exception as e:
                 logger.warning(f"Could not clean old S3 outputs: {e}")
+        elif st.session_state.agent_error is not None and st.session_state.final_data is not None:
+            logger.info("Skipping S3 cleanup — pipeline already completed, error was transient API failure")
         
         # Reset agent state for new request (clear old errors/progress)
         st.session_state.agent_error = None
@@ -2932,8 +2940,6 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
         st.session_state.user_prompt = user_prompt
         st.session_state.agent_running = True
         st.rerun()
-    
-    # Chat input (disabled during processing)
     if st.session_state.agent_running:
         st.info("⏳ **Processing your request...** The agent is currently working. Please wait for the response.")
     
@@ -2944,11 +2950,11 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
     )
     
     if user_input and not st.session_state.agent_running:
-        # Clean up old S3 outputs if retrying after error (prevents stale crosses in progress bar)
-        if st.session_state.agent_error is not None:
+        # Clean up old S3 outputs ONLY if retrying after a pipeline failure
+        # (NOT after transient API errors on query-tool calls where pipeline already succeeded)
+        if st.session_state.agent_error is not None and st.session_state.final_data is None:
             logger.info("Cleaning up old S3 outputs from previous failed attempt")
             try:
-                # Delete old output files to prevent validation from showing stale "failed" status
                 output_prefix = f"{st.session_state.session_id}/outputs/"
                 delete_response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=output_prefix)
                 if 'Contents' in delete_response:
@@ -2957,6 +2963,8 @@ elif st.session_state.uploaded and not st.session_state.agent_running and not st
                         logger.info(f"Deleted old output: {obj['Key']}")
             except Exception as e:
                 logger.warning(f"Could not clean old S3 outputs: {e}")
+        elif st.session_state.agent_error is not None and st.session_state.final_data is not None:
+            logger.info("Skipping S3 cleanup — pipeline already completed, error was transient API failure")
         
         # Reset agent state for new request (clear old errors/progress)
         st.session_state.agent_error = None
@@ -3095,8 +3103,10 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
             
             # Track if we're in summarization mode (will be detected from trace events)
             is_summarization = False
-            # Store in session state so it's available in Loading Results section
+            # Reset per-invocation state so stale values from previous runs don't bleed in
             st.session_state.tools_invoked = False
+            st.session_state.selected_agent = None
+            st.session_state.current_query_type = None
             
             # Invoke agent with user's natural language prompt
             s3_pdf_path = f"s3://{BUCKET_NAME}/{st.session_state.session_id}/input/{st.session_state.uploaded_file_name}"
@@ -3141,13 +3151,35 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     if msg["role"] == "user":
                         conversation_context += f"User: {msg['content']}\n"
                     elif msg["role"] == "assistant" and len(msg.get("content", "")) < 300:
-                        conversation_context += f"Assistant: {msg['content']}\n"
+                        content = msg.get("content", "")
+                        # Skip error messages — they confuse the agent and cause re-runs
+                        if content.startswith("❌") or "An error occurred" in content:
+                            continue
+                        conversation_context += f"Assistant: {content}\n"
             
+            # Silently recover final_data from S3 if previous run timed out but files exist
+            # (No freshness check — session_id is unique so these files are always ours)
+            if st.session_state.final_data is None and st.session_state.session_id:
+                recovered = load_final_summary(st.session_state.session_id)
+                if recovered:
+                    st.session_state.final_data = recovered
+                    logger.info("✅ Pre-invocation S3 recovery: loaded final_data from previous pipeline run")
+
             # Append context to user prompt if exists
             enhanced_prompt = st.session_state.user_prompt
             if conversation_context:
                 enhanced_prompt = f"{st.session_state.user_prompt}\n{conversation_context}"
-            
+
+            # If summarization already completed (recovered from S3 or loaded earlier), tell the agent
+            # so it does NOT re-run the pipeline — just query the existing data
+            if st.session_state.final_data is not None:
+                enhanced_prompt += (
+                    "\n\n[SYSTEM NOTE: The 6-step medical summarization pipeline has ALREADY completed "
+                    "successfully for this session. All patient data is available in S3. "
+                    "Do NOT re-run DocumentExtractionTool or any pipeline step. "
+                    "Use aps_query_patient_data to answer the user's question directly.]"
+                )
+
             response = invoke_bedrock_agent(s3_pdf_path, st.session_state.session_id, enhanced_prompt)
             
             if not response:
@@ -3194,7 +3226,8 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     # proactively check S3 to detect if summarization pipeline is running
                     # Use file age check (< 2 minutes) to avoid false positives from old S3 files
                     if (event_count >= 5 and event_count % 3 == 0 and 
-                        not is_summarization and not has_received_response):
+                        not is_summarization and not has_received_response and
+                        st.session_state.final_data is None):
                         logger.info(f"Proactive S3 check after {event_count} trace events (no chunks yet)...")
                         # Check if Step 1 output exists in S3 (extracted_text.json)
                         # AND check if it was created recently (within last 2 minutes) to avoid old files
@@ -3428,133 +3461,185 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                                     display_pipeline_progress(st.session_state.current_step)
                     
                     # Handle trace events (tool usage, orchestration)
-                    # Detect if we're in summarization mode based on tool invocations
+                    # AWS Bedrock actual structure: event["trace"]["trace"]["orchestrationTrace"]
                     elif "trace" in event:
                         trace = event["trace"]
+                        # Correct nested structure: the inner "trace" key holds the actual trace data
+                        inner_trace = trace.get("trace", {})
                         
-                        # Show model invocation (agent thinking)
-                        if "modelInvocationInput" in trace:
-                            add_message("🧠 Agent: Reasoning and planning...")
+                        orch_trace = inner_trace.get("orchestrationTrace", {})
                         
-                        # Check for agent step information
-                        if "agentStep" in trace:
-                            agent_step = trace["agentStep"]
+                        if orch_trace:
+                            # Model reasoning/thinking
+                            if "modelInvocationInput" in orch_trace:
+                                logger.debug("Agent reasoning...")
                             
-                            # Pre-processing
-                            if "preProcessing" in agent_step:
-                                logger.info("Agent pre-processing request...")
-                            
-                            # Orchestration (thinking/planning)
-                            elif "orchestration" in agent_step:
-                                orch = agent_step["orchestration"]
-                                if "actionGroupInvocation" in orch:
-                                    logger.info("Agent planning action...")
-                                else:
-                                    logger.info("Agent thinking...")
-                            
-                            # Tool invocation - start of tool execution
-                            elif "toolInvocations" in agent_step:
-                                for tool_inv in agent_step["toolInvocations"]:
-                                    tool_name = tool_inv.get("toolName", "Unknown")
+                            # ----- Tool invocation input (agent calling a tool) -----
+                            inv_input = orch_trace.get("invocationInput", {})
+                            if inv_input:
+                                ag_input = inv_input.get("actionGroupInvocationInput", {})
+                                if ag_input:
+                                    tool_name = ag_input.get("actionGroupName", "Unknown")
                                     st.session_state.current_tool = tool_name
                                     
-                                    # Detect summarization mode by checking tool names
-                                    if not is_summarization and any(tool in tool_name.lower() for tool in ["extraction", "medical", "icd", "diagnostic", "risk"]):
+                                    # Parameters can be in two locations depending on action group type:
+                                    # 1. Function-based: ag_input["parameters"] = [{"name":...,"value":...}]
+                                    # 2. API schema-based (OpenAPI): ag_input["requestBody"]["content"]["application/json"]["properties"]
+                                    def _extract_params(ag):
+                                        # Try function-based first (parameters is a non-empty list)
+                                        params = ag.get("parameters", [])
+                                        if params and isinstance(params, list):
+                                            return params
+                                        # Try API schema-based (OpenAPI):
+                                        # requestBody["content"]["application/json"] is a list of {name, type, value}
+                                        try:
+                                            rb = ag["requestBody"]["content"]["application/json"]
+                                            if isinstance(rb, list):
+                                                return rb
+                                            if isinstance(rb, dict):
+                                                return rb.get("properties", [])
+                                        except (KeyError, TypeError):
+                                            pass
+                                        return []
+                                    
+                                    parameters = _extract_params(ag_input)
+                                    
+                                    # Extract queryType and sessionId from parameters
+                                    # List format (function-based): [{"name": "queryType", "value": "..."}]
+                                    # Dict format (API schema-based): {"queryType": {"value": "..."}, ...}
+                                    query_type = "unknown"
+                                    session_id_param = None
+                                    if isinstance(parameters, list):
+                                        for p in parameters:
+                                            if p.get("name") in ("queryType", "query_type"):
+                                                query_type = p.get("value", "unknown")
+                                            elif p.get("name") == "sessionId":
+                                                session_id_param = p.get("value")
+                                    elif isinstance(parameters, dict):
+                                        qt = parameters.get("queryType") or parameters.get("query_type")
+                                        if qt:
+                                            query_type = qt.get("value", "unknown") if isinstance(qt, dict) else str(qt)
+                                        sid = parameters.get("sessionId")
+                                        if sid:
+                                            session_id_param = sid.get("value") if isinstance(sid, dict) else str(sid)
+                                    
+                                    logger.debug(f"Trace invocationInput raw params: {parameters}")
+                                    
+                                    # --- Query tool (query-patient-data Lambda) ---
+                                    if "query" in tool_name.lower() and not is_summarization:
+                                        st.session_state.tools_invoked = True
+                                        st.session_state.selected_agent = "APS Managing Agent"
+                                        st.session_state.current_query_type = query_type
+                                        query_label = query_type.replace("_", " ").title()
+                                        
+                                        logger.info(f"🔍 QUERY TOOL INVOKED: {tool_name}")
+                                        logger.info(f"   ├─ queryType : {query_type}")
+                                        logger.info(f"   └─ sessionId : {session_id_param}")
+                                        
+                                        agent_status_display.info(f"🔍 **Lambda Tool:** `{tool_name}` → querying `{query_type}`")
+                                        add_message(f"🔍 Calling Lambda: {tool_name} (queryType={query_type})")
+                                        tool_display.info(f"🔍 **Querying:** {query_label}...")
+                                    
+                                    # --- Summarization tool ---
+                                    elif not is_summarization and any(kw in tool_name.lower() for kw in ["extraction", "medical", "icd", "diagnostic", "risk"]):
                                         is_summarization = True
                                         st.session_state.tools_invoked = True
                                         st.session_state.selected_agent = "APS Summarization Agent"
-                                        logger.info("DETECTED: Summarization mode - initializing 6-step pipeline tracking")
+                                        logger.info(f"DETECTED: Summarization mode via trace event - tool={tool_name}")
                                         agent_status_display.success("✅ **Agent Assigned:** APS Summarization Agent")
-                                        
-                                        # Add system message to chat
                                         add_message("📊 Routed to: APS Summarization Agent (6-step medical analysis)")
-                                        
-                                        # Initialize pipeline tracking
                                         st.session_state.step_status[0] = "running"
                                         st.session_state.current_step = 0
-                                        # Show initial progress
                                         with progress_container.container():
                                             display_pipeline_progress(0)
                                     
-                                    # Update step based on tool name using mapping (only if summarization)
+                                    # --- Update summarization pipeline step ---
                                     if is_summarization:
                                         tool_lower = tool_name.lower()
-                                        step_found = False
                                         for key, val in STEP_MAP.items():
                                             if key in tool_lower:
-                                                step_idx = val - 1  # Convert to 0-indexed
-                                            
-                                            # Mark previous step as success if we're moving to next step
-                                            if st.session_state.current_step < step_idx and st.session_state.current_step < len(PIPELINE_STEPS):
-                                                if st.session_state.step_status[st.session_state.current_step] == "running":
-                                                    st.session_state.step_status[st.session_state.current_step] = "success"
-                                            
-                                            # Set current step as running
-                                            if step_idx < len(PIPELINE_STEPS):
-                                                st.session_state.step_status[step_idx] = "running"
-                                                st.session_state.current_step = step_idx
-                                            
-                                            step_found = True
-                                            break
-                                        
+                                                step_idx = val - 1
+                                                if st.session_state.current_step < step_idx and st.session_state.current_step < len(PIPELINE_STEPS):
+                                                    if st.session_state.step_status[st.session_state.current_step] == "running":
+                                                        st.session_state.step_status[st.session_state.current_step] = "success"
+                                                if step_idx < len(PIPELINE_STEPS):
+                                                    st.session_state.step_status[step_idx] = "running"
+                                                    st.session_state.current_step = step_idx
+                                                break
                                         logger.info(f"Starting tool: {tool_name}")
                                         add_message(f"🔧 Running: {PIPELINE_STEPS[st.session_state.current_step]['name']}")
                                         tool_display.info(f"🔧 Processing: **{PIPELINE_STEPS[st.session_state.current_step]['name']}**")
-                                        
-                                        # Update progress display immediately
                                         with progress_container.container():
                                             display_pipeline_progress(st.session_state.current_step)
                             
-                            # Observation - tool completed
-                            elif "observation" in agent_step:
-                                obs = agent_step["observation"]
+                            # ----- Observation (tool response) -----
+                            obs = orch_trace.get("observation", {})
+                            if obs:
+                                ag_output = obs.get("actionGroupInvocationOutput", {})
+                                obs_text = ag_output.get("text", "") if ag_output else ""
                                 
-                                # Only process observations if we detected summarization mode
+                                # --- Query tool response path ---
+                                if not is_summarization and st.session_state.get("tools_invoked") and obs_text:
+                                    lambda_answer = None
+                                    lambda_status = None
+                                    try:
+                                        import json as _json
+                                        obs_json = _json.loads(obs_text)
+                                        lambda_answer = obs_json.get("answer", "")
+                                        lambda_status = obs_json.get("status", "unknown")
+                                    except Exception:
+                                        lambda_answer = obs_text[:300] if obs_text else None
+                                    
+                                    query_type = st.session_state.get("current_query_type", "unknown")
+                                    logger.info(f"🔍 LAMBDA RESPONSE RECEIVED:")
+                                    logger.info(f"   ├─ queryType : {query_type}")
+                                    logger.info(f"   ├─ status    : {lambda_status}")
+                                    logger.info(f"   └─ answer    : {(lambda_answer or '')[:300]}")
+                                    
+                                    if lambda_answer:
+                                        tool_display.success(f"✅ **Lambda returned:** {lambda_answer[:120]}{'...' if len(lambda_answer) > 120 else ''}")
+                                        add_message(f"✅ Lambda answer received (status={lambda_status})")
+                                    else:
+                                        logger.warning(f"⚠️ Lambda observation unparseable: {obs_text[:200]}")
+                                        tool_display.success("✅ **Lambda tool completed**")
+                                
+                                # --- Summarization pipeline observation ---
                                 if is_summarization:
                                     logger.info(f"Observation event received for step {st.session_state.current_step + 1}")
-                                
-                                # When we see an observation, the current tool completed
-                                if st.session_state.current_step < len(PIPELINE_STEPS):
-                                    if st.session_state.step_status[st.session_state.current_step] == "running":
-                                        step_name = PIPELINE_STEPS[st.session_state.current_step]['name']
-                                        logger.info(f"Tool completed: {step_name}")
-                                        
-                                        # Check if observation contains error
-                                        obs_text = str(obs)
-                                        if "error" in obs_text.lower() and "failed" in obs_text.lower():
-                                            st.session_state.step_status[st.session_state.current_step] = "failed"
-                                            add_message(f"❌ {step_name} failed", level="error")
-                                            tool_display.error(f"❌ Failed: **{step_name}**")
-                                        else:
-                                            # Validate S3 output with retries - this will update status if found
-                                            add_message(f"🔍 Verifying {step_name} output...")
-                                            tool_display.info(f"🔍 Verifying: **{step_name}**")
-                                            
-                                            # Validate with retries (max 5 attempts, 3 seconds each)
-                                            if validate_single_step_from_s3(st.session_state.session_id, st.session_state.current_step):
-                                                add_message(f"✅ {step_name} completed")
-                                                tool_display.success(f"✅ Completed: **{step_name}**")
+                                    if st.session_state.current_step < len(PIPELINE_STEPS):
+                                        if st.session_state.step_status[st.session_state.current_step] == "running":
+                                            step_name = PIPELINE_STEPS[st.session_state.current_step]['name']
+                                            logger.info(f"Tool completed: {step_name}")
+                                            if "error" in obs_text.lower() and "failed" in obs_text.lower():
+                                                st.session_state.step_status[st.session_state.current_step] = "failed"
+                                                add_message(f"❌ {step_name} failed", level="error")
+                                                tool_display.error(f"❌ Failed: **{step_name}**")
                                             else:
-                                                # Mark as success even if S3 validation failed (eventual consistency)
-                                                st.session_state.step_status[st.session_state.current_step] = "success"
-                                                add_message(f"✅ {step_name} completed (file pending)", level="warning")
-                                                tool_display.success(f"✅ Completed: **{step_name}**")
-                                        
-                                        # Update progress display
-                                        with progress_container.container():
-                                            display_pipeline_progress(st.session_state.current_step)
-                            
-                            # Post-processing
-                            elif "postProcessing" in agent_step:
-                                logger.info("Agent post-processing results...")
-                                # Mark current step as success when post-processing
-                                if st.session_state.current_step < len(PIPELINE_STEPS):
-                                    if st.session_state.step_status[st.session_state.current_step] == "running":
-                                        st.session_state.step_status[st.session_state.current_step] = "success"
-                                        
-                                        # Update progress display
-                                        with progress_container.container():
-                                            display_pipeline_progress(st.session_state.current_step)
+                                                add_message(f"🔍 Verifying {step_name} output...")
+                                                tool_display.info(f"🔍 Verifying: **{step_name}**")
+                                                if validate_single_step_from_s3(st.session_state.session_id, st.session_state.current_step):
+                                                    add_message(f"✅ {step_name} completed")
+                                                    tool_display.success(f"✅ Completed: **{step_name}**")
+                                                else:
+                                                    # Tool returned but file not yet in S3 — keep as running
+                                                    # Final validate_pipeline_status_from_s3 will confirm at stream end
+                                                    logger.info(f"⏳ {step_name}: tool returned but S3 file pending — will confirm at end")
+                                                    add_message(f"⏳ {step_name} — confirming output...")
+                                                    tool_display.info(f"⏳ Confirming: **{step_name}**...")
+                                            with progress_container.container():
+                                                display_pipeline_progress(st.session_state.current_step)
+                        
+                        # Pre/post-processing traces (outside orchestrationTrace)
+                        if inner_trace.get("preProcessingTrace"):
+                            logger.debug("Agent pre-processing request...")
+                        if inner_trace.get("postProcessingTrace"):
+                            logger.debug("Agent post-processing results...")
+                            # Mark current summarization step as success on post-processing
+                            if is_summarization and st.session_state.current_step < len(PIPELINE_STEPS):
+                                if st.session_state.step_status[st.session_state.current_step] == "running":
+                                    st.session_state.step_status[st.session_state.current_step] = "success"
+                                    with progress_container.container():
+                                        display_pipeline_progress(st.session_state.current_step)
                     
                     # Stop processing if error detected
                     if has_error:
@@ -3568,7 +3653,16 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 
                 # Event stream completed
                 logger.info(f"Event stream iteration completed - Total events: {event_count}")
-                logger.info(f"Conversational mode: {not is_summarization} | Selected agent: {st.session_state.get('selected_agent')}")
+                
+                # Determine mode based on tool invocation
+                tools_invoked = st.session_state.get('tools_invoked', False)
+                mode_description = "summarization" if is_summarization else ("query tool" if tools_invoked else "conversational")
+                logger.info(f"━━━ RESPONSE SUMMARY ━━━")
+                logger.info(f"  Mode      : {mode_description}")
+                logger.info(f"  Source    : {'Lambda tool (query-patient-data)' if (tools_invoked and not is_summarization) else ('APS Summarization Agent (6-step pipeline)' if is_summarization else 'APS Managing Agent (direct / memory)')}")
+                logger.info(f"  Agent     : {st.session_state.get('selected_agent')}")
+                logger.info(f"  queryType : {st.session_state.get('current_query_type', 'N/A')}")
+                logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━")
                 
                 # Validate step status from S3 outputs (only for summarize mode)
                 if is_summarization:
@@ -3578,8 +3672,13 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     # Update progress display with validated status
                     with progress_container.container():
                         display_pipeline_progress(st.session_state.current_step)
+                elif tools_invoked:
+                    # Query tool mode - Lambda was called (e.g., query-patient-data)
+                    logger.info("Query tool mode: Lambda tool invoked successfully")
+                    agent_status_display.success("✅ **Tool Invoked:** Query completed")
+                    add_message("✅ Query tool executed successfully")
                 else:
-                    # Conversational mode - Managing Agent responded directly without routing
+                    # True conversational mode - Managing Agent responded directly without routing
                     logger.info("Conversational mode: Managing Agent handled request directly (no tools invoked)")
                     st.session_state.selected_agent = "APS Managing Agent"
                     agent_status_display.success("✅ **Agent Response:** Managing Agent (conversational)")
@@ -3602,39 +3701,92 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                     add_message("✅ Processing complete!")
                     if is_summarization:
                         logger.info("Summarization mode: Agent processing completed successfully")
-                        
-                        # For summarization: Add brief confirmation message, not full response
-                        # Extract patient name from response if available (simple extraction)
-                        patient_name = "the patient"
-                        if agent_response_text:
-                            # Try to extract name from response (e.g., "for Daniel Robert Kline")
-                            import re
-                            name_match = re.search(r'for ([A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?)', agent_response_text)
-                            if name_match:
-                                patient_name = name_match.group(1)
-                        
-                        # Build enhanced status message with risk level if available
-                        doc_status_msg = f"✅ APS analysis complete for **{patient_name}**."
-                        
-                        # Try to add risk level summary if data already loaded
-                        if st.session_state.final_data:
-                            exec_summary = st.session_state.final_data.get("executive_summary", {})
-                            risk_level = exec_summary.get("risk_level", "")
-                            if risk_level:
-                                risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
-                                doc_status_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
-                        
-                        doc_status_msg += " Click **View Dashboard** below to explore the full results."
-                        
-                        # Add brief confirmation to chat
+
+                        # Prefer the managing agent's dynamic response text (contains per-run
+                        # phrasing and — in the auto-trigger case — the answer to the original
+                        # question such as lab results, conditions, etc.).
+                        # Fall back to a structured status message only when the agent returned
+                        # nothing meaningful (very short or empty response).
+                        CTA = " Click **View Dashboard** below to explore the full results."
+
+                        if agent_response_text and len(agent_response_text.strip()) > 60:
+                            # Extract a concise 1-2 sentence summary from the agent's full
+                            # response — skip markdown headers (#), bullet lines (- / *),
+                            # table lines (|), numbered list items (1. / 1) / a.) and blank lines,
+                            # then take the first meaningful prose lines.
+                            prose_lines = []
+                            for _line in agent_response_text.splitlines():
+                                _l = _line.strip()
+                                if not _l:
+                                    continue
+                                if _l.startswith("#") or _l.startswith("-") or _l.startswith("*") or _l.startswith("|"):
+                                    continue
+                                # Skip numbered list items: "1.", "1)", "a.", "a)"
+                                if re.match(r'^(\d+|[a-zA-Z])[.)]\s', _l):
+                                    continue
+                                prose_lines.append(_l)
+                                if len(prose_lines) == 2:
+                                    break  # collect up to 2 prose lines to handle multi-line replies
+
+                            if prose_lines:
+                                # Take up to the first 2 sentences of the first prose paragraph
+                                first_prose = " ".join(prose_lines)
+                                sentences = re.split(r'(?<=[.!?])\s+', first_prose)
+                                condensed = " ".join(sentences[:2]).strip()
+                            else:
+                                condensed = agent_response_text.strip()[:300]
+
+                            # Use pipeline step validation as the authoritative success signal.
+                            # final_data is not yet loaded at this point in the stream, so
+                            # we check whether all pipeline steps completed from S3.
+                            pipeline_succeeded = any(
+                                s == "success" for s in st.session_state.step_status
+                            )
+                            if not pipeline_succeeded:
+                                # Pipeline didn't produce data — show agent message as-is, no CTA
+                                final_msg = f"⚠️ {condensed}"
+                                logger.info("Pipeline steps not succeeded — omitting View Dashboard CTA")
+                            else:
+                                # Pipeline succeeded — prefix with ✅ and add CTA
+                                final_msg = f"✅ {condensed}"
+                                if "view dashboard" not in final_msg.lower() and "dashboard" not in final_msg.lower():
+                                    final_msg += f" {CTA}"
+
+                            logger.info(f"Using condensed dynamic response (from {len(agent_response_text)} chars) for summarization completion message")
+                        else:
+                            # Fallback: build a structured status message from S3 data
+                            patient_name = "the patient"
+                            if st.session_state.final_data:
+                                exec_sum = st.session_state.final_data.get("executive_summary", {})
+                                if exec_sum.get("patient_name"):
+                                    patient_name = exec_sum["patient_name"]
+                            if patient_name == "the patient" and agent_response_text:
+                                import re
+                                name_match = re.search(r'for ([A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?)', agent_response_text)
+                                if name_match:
+                                    patient_name = name_match.group(1)
+
+                            final_msg = f"✅ APS analysis complete for **{patient_name}**."
+                            if st.session_state.final_data:
+                                exec_summary = st.session_state.final_data.get("executive_summary", {})
+                                risk_level = exec_summary.get("risk_level", "")
+                                if risk_level:
+                                    risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
+                                    final_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
+                            final_msg += CTA
+                            logger.info("Using fallback structured message (agent response was empty/too short)")
+
+                        # Add message to chat
                         st.session_state.chat_messages.append({
                             "role": "assistant",
-                            "content": doc_status_msg,
+                            "content": final_msg,
                             "agent": st.session_state.selected_agent or "APS Summarization Agent",
                             "timestamp": datetime.now()
                         })
                     else:
-                        logger.info("Agent response received successfully")
+                        is_lambda_sourced = tools_invoked and not is_summarization
+                        source_label = "via Lambda tool" if is_lambda_sourced else "via Managing Agent (direct)"
+                        logger.info(f"Agent response received successfully [{source_label}]")
                         logger.info(f"Agent response length: {len(agent_response_text)} characters")
                         
                         # For conversational mode: Add full response to chat history
@@ -3694,21 +3846,58 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                         # Success! We have data from S3 (Steps 1-5 completed)
                         # Don't show error - show success message instead
                         logger.info("✅ Despite timeout, successfully recovered data from S3 (Steps 1-5 complete)")
+                    else:
+                        # final_data not in S3 yet — the last Lambda may still be writing.
+                        # Wait up to 30s and retry before declaring genuine failure.
+                        logger.warning("⏳ Timeout with no S3 data yet — waiting up to 30s for last step to complete...")
+                        for _retry in range(6):
+                            time.sleep(5)
+                            temp_final_data = load_final_summary(st.session_state.session_id)
+                            if temp_final_data:
+                                logger.info(f"✅ S3 data appeared after {(_retry+1)*5}s retry — recovering successfully")
+                                validate_pipeline_status_from_s3(st.session_state.session_id)
+                                break
+                            logger.warning(f"  Retry {_retry+1}/6: still waiting...")
+                    
+                    if temp_final_data:
                         st.session_state.final_data = temp_final_data
                         
-                        # Extract patient name for success message
-                        patient_name = "the patient"
                         exec_summary = temp_final_data.get("executive_summary", {})
-                        if exec_summary.get("patient_name"):
-                            patient_name = exec_summary.get("patient_name")
-                        
-                        # Build success message with risk level
-                        success_msg = f"✅ APS analysis complete for **{patient_name}**."
-                        risk_level = exec_summary.get("risk_level", "")
-                        if risk_level:
-                            risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
-                            success_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
-                        success_msg += " Click **View Dashboard** below to explore the full results."
+                        patient_name = exec_summary.get("patient_name") or "the patient"
+                        CTA = " Click **View Dashboard** below to explore the full results."
+
+                        # Reuse dynamic response if the agent returned meaningful text
+                        # before it timed out (e.g. it finished but the stream closed early).
+                        if agent_response_text and len(agent_response_text.strip()) > 60:
+                            prose_lines = []
+                            for _line in agent_response_text.splitlines():
+                                _l = _line.strip()
+                                if not _l:
+                                    continue
+                                if _l.startswith(("#", "-", "*", "|")):
+                                    continue
+                                if re.match(r'^(\d+|[a-zA-Z])[.)]\s', _l):
+                                    continue
+                                prose_lines.append(_l)
+                                if len(prose_lines) == 2:
+                                    break
+                            if prose_lines:
+                                first_prose = " ".join(prose_lines)
+                                sentences = re.split(r'(?<=[.!?])\s+', first_prose)
+                                condensed = " ".join(sentences[:2]).strip()
+                            else:
+                                condensed = agent_response_text.strip()[:300]
+                            success_msg = f"✅ {condensed}"
+                            if "view dashboard" not in success_msg.lower() and "dashboard" not in success_msg.lower():
+                                success_msg += f"{CTA}"
+                        else:
+                            # Fallback: structured message with patient name + risk level
+                            success_msg = f"✅ APS analysis complete for **{patient_name}**."
+                            risk_level = exec_summary.get("risk_level", "")
+                            if risk_level:
+                                risk_emoji = "🔴" if risk_level.lower() == "high" else ("🟡" if risk_level.lower() == "moderate" else "🟢")
+                                success_msg += f" Overall risk: {risk_emoji} **{risk_level.capitalize()}**."
+                            success_msg += CTA
                         
                         # Add success message to chat (not error)
                         st.session_state.chat_messages.append({
@@ -3747,7 +3936,17 @@ elif st.session_state.agent_running == True and not st.session_state.agent_compl
                 
                 # Show concise error message for dependencyFailedException
                 if "dependencyFailedException" in error_msg:
-                    st.warning("⚠️ **Lambda Error:** A Lambda function returned an error to Bedrock Agent. Check CloudWatch logs for details.")
+                    # Replace the generic error message in chat with a friendlier retry prompt
+                    # so it doesn't pollute the next conversation context
+                    for i in range(len(st.session_state.chat_messages) - 1, -1, -1):
+                        msg = st.session_state.chat_messages[i]
+                        if msg["role"] == "assistant" and "dependencyFailedException" in msg.get("content", ""):
+                            st.session_state.chat_messages[i]["content"] = (
+                                "⚠️ The request couldn't be completed due to a temporary service error. "
+                                "Please try again in a moment."
+                            )
+                            break
+                    st.warning("⚠️ **Transient error:** Lambda returned an error. Please retry your question.")
                     logger.error(f"dependencyFailedException details: {error_msg}")
                 
                 time.sleep(3)
@@ -3804,6 +4003,14 @@ elif st.session_state.agent_completed and not st.session_state.show_dashboard:
         st.session_state.conversation_active = True
         st.rerun()
     
+    # Check if error message indicates a Textract/extraction failure — do this FIRST
+    # so the progress bar gate below can use it
+    is_summarization_error = False
+    if st.session_state.agent_error:
+        error_lower = st.session_state.agent_error.lower()
+        is_summarization_error = ("document extraction" in error_lower or "textract" in error_lower) and \
+                                 ("capacity" in error_lower or "throughput" in error_lower or "could not be completed" in error_lower)
+
     # Not conversational - must be summarization or error, validate pipeline from S3
     with st.spinner("⏳ Checking for results..."):
         try:
@@ -3812,40 +4019,20 @@ elif st.session_state.agent_completed and not st.session_state.show_dashboard:
             has_pipeline_attempt = any(status in ["success", "failed", "running"] for status in st.session_state.step_status)
             if has_pipeline_attempt:
                 logger.info("Pipeline activity detected - this was a summarization request")
-                display_pipeline_progress(6)
+                # Only render progress bar here if the error block below won't render its own
+                if not is_summarization_error:
+                    display_pipeline_progress(6)
             else:
                 logger.info("No pipeline activity - checking for errors")
         except:
             has_pipeline_attempt = False
             logger.info("No pipeline outputs detected")
     
-    # Check if error message indicates a summarization attempt (Textract/extraction errors)
-    is_summarization_error = False
-    if st.session_state.agent_error:
-        error_lower = st.session_state.agent_error.lower()
-        is_summarization_error = ("document extraction" in error_lower or "textract" in error_lower) and \
-                                 ("capacity" in error_lower or "throughput" in error_lower or "could not be completed" in error_lower)
-    
     # If we detected a summarization error (Textract failure), show error immediately
     if is_summarization_error:
         logger.warning("Textract capacity error detected - showing error message instead of loading results")
         
-        st.error("⚠️ **AWS Textract Service Limit Reached**")
-        st.markdown("""
-        The document extraction service (AWS Textract) has reached its request limit. This is a **temporary** issue.
-        
-        **What this means:**
-        - AWS Textract processes text from PDF documents
-        - The service has capacity limits to ensure fair usage
-        - Your request was correctly routed to the Summarization Agent, but Step 1 (Text Extraction) failed
-        
-        **What to do:**
-        - ⏰ Wait 2-3 minutes for service capacity to free up
-        - 🔄 Click "New Assessment" below and try again
-        - ✅ Your PDF is already uploaded and ready
-        
-        **Note:** This is an AWS infrastructure limitation, not an issue with your document or the application.
-        """)
+        st.error("⚠️ AWS Textract service limit reached — this is a temporary AWS infrastructure issue. Please wait 2-3 minutes and try again.")
         
         # Show pipeline progress with Step 1 failed
         if has_pipeline_attempt:
@@ -3853,9 +4040,20 @@ elif st.session_state.agent_completed and not st.session_state.show_dashboard:
             display_pipeline_progress(0)
         
         st.markdown("---")
-        if st.button("🔄 New Assessment", type="primary", use_container_width=True):
-            reset_session()
-            st.rerun()
+        col_back, col_new = st.columns(2)
+        with col_back:
+            if st.button("⬅️ Back to Chat", use_container_width=True):
+                st.session_state.agent_completed = False
+                st.session_state.agent_running = False
+                st.session_state.agent_error = None
+                st.session_state.current_step = 0
+                st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
+                st.session_state.conversation_active = True
+                st.rerun()
+        with col_new:
+            if st.button("🔄 New Assessment", type="primary", use_container_width=True):
+                reset_session()
+                st.rerun()
         
         st.stop()
     
@@ -3891,47 +4089,20 @@ elif st.session_state.agent_completed and not st.session_state.show_dashboard:
             # Check for Textract/throughput errors first
             if st.session_state.agent_error:
                 error_text = st.session_state.agent_error.lower()
-                if ("textract" in error_text or "document extraction" in error_text) and ("constrai" in error_text or "constrai" in error_text or "throughput" in error_text or "limit" in error_text or "provisioned" in error_text or "cannot be completed" in error_text):
-                    st.error("⚠️ **AWS Textract Service Limit Reached**")
-                    st.markdown("""
-                    The document extraction service (AWS Textract) has reached its request limit. This is a **temporary** issue.
-                    
-                    **What this means:**
-                    - AWS Textract has a limit on how many requests can be processed per minute
-                    - The limit has been temporarily exceeded
-                    - This is common during high-usage periods
-                    
-                    **What to do:**
-                    - Wait 2-3 minutes for the quota to reset
-                    - Click the "Clear Session & Retry" button below
-                    - Upload your document again
-                    
-                    The service will automatically recover once the rate limit resets.
-                    """)
-                    
+                if ("textract" in error_text or "document extraction" in error_text) and ("constrai" in error_text or "throughput" in error_text or "limit" in error_text or "provisioned" in error_text or "cannot be completed" in error_text):
+                    st.error("⚠️ AWS Textract service limit reached — please wait 2-3 minutes and try again.")
                     if st.button("🔄 Clear Session & Retry", type="primary"):
-                        # Clear session
                         for key in list(st.session_state.keys()):
                             del st.session_state[key]
                         st.rerun()
-                    
-                    st.caption("💡 If the issue persists after multiple retries, please contact support.")
                     logger.error("Textract throughput error displayed to user")
                 
                 elif "throughput exceeded" in error_text or "provisioned throughput" in error_text:
-                    st.error("⚠️ **Service Throughput Limit Exceeded**")
-                    st.markdown("""
-                    The system is experiencing high demand and has temporarily exceeded its processing capacity.
-                    
-                    **Please wait 2-3 minutes and try again.**
-                    """)
-                    
+                    st.error("⚠️ Service throughput limit exceeded — please wait 2-3 minutes and try again.")
                     if st.button("🔄 Clear Session & Retry", type="primary"):
-                        # Clear session
                         for key in list(st.session_state.keys()):
                             del st.session_state[key]
                         st.rerun()
-                    
                     logger.error("Throughput error displayed to user")
             
             # Check if this is the "no images" case (Steps 1-3 completed, but 4-5 missing)
@@ -4037,14 +4208,21 @@ elif st.session_state.agent_completed and not st.session_state.show_dashboard:
                     st.caption("📋 CloudWatch Log: `/aws/lambda/aps-risk-analyzer-and-summary`")
                     logger.error("Step 6 failed: No enhanced_medical_summary_with_risks.json found")
             
-            if st.button("⬅️ Go Back and Try Again"):
-                # Reset all agent state including step status to clear failure icons
-                st.session_state.agent_completed = False
-                st.session_state.agent_running = False
-                st.session_state.agent_error = None
-                st.session_state.current_step = 0
-                st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
-                st.rerun()
+            col_back, col_new = st.columns(2)
+            with col_back:
+                if st.button("⬅️ Back to Chat", use_container_width=True):
+                    # Return to conversation without resetting session
+                    st.session_state.agent_completed = False
+                    st.session_state.agent_running = False
+                    st.session_state.agent_error = None
+                    st.session_state.current_step = 0
+                    st.session_state.step_status = ["pending"] * len(PIPELINE_STEPS)
+                    st.session_state.conversation_active = True
+                    st.rerun()
+            with col_new:
+                if st.button("🔄 New Assessment", type="primary", use_container_width=True):
+                    reset_session()
+                    st.rerun()
     else:
         # final_data already exists - this shouldn't normally happen for summarization requests
         # but handle gracefully by returning to chat
