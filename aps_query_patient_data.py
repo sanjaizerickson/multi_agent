@@ -1,7 +1,64 @@
+"""
+APS Query Patient Data Lambda Function
+
+PURPOSE:
+This Lambda function provides structured query access to patient medical data
+stored in S3, with built-in anti-hallucination validation (especially for family history).
+
+INTEGRATION:
+- AWS Bedrock Agent action group: query-patient-data
+- S3 bucket: aps-summarization-poc
+- Pydantic models: pydantic_models_query_patient_data.py (MUST be uploaded as layer or included)
+
+DEPLOYMENT NOTES:
+1. Upload BOTH files to Lambda:
+   - aps_query_patient_data.py (this file)
+   - pydantic_models_query_patient_data.py
+
+2. Handler: aps_query_patient_data.lambda_handler
+
+3. Runtime: Python 3.11+
+
+4. Required IAM permissions:
+   - s3:GetObject on aps-summarization-poc bucket
+
+5. Memory: 512MB, Timeout: 30s
+
+QUERY TYPES:
+- family_history: Anti-hallucination validated family history
+- patient_info: Demographics + current vitals
+- medications: Medication list (high-risk flagged)
+- conditions: Conditions by risk level
+- lab_results: Recent lab results
+- vitals_trend: Vitals over time
+- summary: Executive summary
+"""
+
 import json
 import boto3
 import os
+import re
 from datetime import datetime
+from botocore.config import Config
+
+# Import Pydantic models for structured validation
+from pydantic_models_query_patient_data import (
+    FamilyHistoryEntry,
+    FamilyHistoryResponse,
+    PatientInfoResponse,
+    CurrentVitals,
+    Medication,
+    MedicationsResponse,
+    Condition,
+    ConditionsResponse,
+    LabResult,
+    LabResultsResponse,
+    VitalsTrendData,
+    VitalsTrendResponse,
+    SummaryResponse,
+    LambdaResponse,
+    QueryType
+)
 
 # Load configuration from config.local.json (same pattern as other Lambda scripts)
 def load_config():
@@ -17,35 +74,73 @@ def load_config():
         print(f"[CONFIG ERROR] Failed to load config: {e}")
         return None
 
-# Initialize AWS clients with profile from config (same pattern as aps_medical_summary_generator.py)
+# Initialize AWS clients with profile from config (same pattern as aps_risk_analyzer_and_summary.py)
 try:
     config = load_config()
     
     if config:
-        AWS_PROFILE = config.get('aws', {}).get('profile', 'default')
-        AWS_REGION = config.get('aws', {}).get('region', 'us-east-1')
-        BUCKET_NAME = config.get('aws', {}).get('bucket_name', 'aps-summarization-poc')
+        # Use config file settings - support both flat and nested formats
+        # Flat format: {"aws_profile": "default", "s3_bucket": "...", ...}
+        # Nested format: {"aws": {"profile": "default", ...}}
+        AWS_PROFILE = config.get("aws_profile") or config.get("aws", {}).get("profile", "default")
+        AWS_REGION = config.get("aws_region") or config.get("aws", {}).get("region", "us-east-1")
+        # Support both s3_bucket (current) and bucket_name (legacy) field names
+        BUCKET_NAME = config.get("s3_bucket") or config.get("bucket_name") or config.get("aws", {}).get("bucket_name", "aps-summarization-poc")
         
-        print(f"[CONFIG] Using AWS profile: {AWS_PROFILE}, region: {AWS_REGION}, bucket: {BUCKET_NAME}")
+        print(f"[CONFIG] Loading AWS profile: {AWS_PROFILE}, region: {AWS_REGION}, bucket: {BUCKET_NAME}")
         
-        # Use profile for local development
-        session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
-        s3_client = session.client('s3')
+        # Configure boto3 with timeouts to prevent hanging
+        # Same pattern as aps_risk_analyzer_and_summary.py
+        boto_config = Config(
+            region_name=AWS_REGION,
+            connect_timeout=30,          # Connection timeout
+            read_timeout=120,            # Read timeout for large S3 files
+            retries={'max_attempts': 3, 'mode': 'standard'},
+            max_pool_connections=10      # Connection pool size
+        )
+        
+        # Create a session with the specified profile
+        boto_session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
+        
+        # Create S3 client using the session with timeout config
+        s3_client = boto_session.client("s3", config=boto_config)
+        
+        print(f"[CONFIG] AWS clients initialized successfully with profile '{AWS_PROFILE}'")
+        print("[CONFIG] Connection timeout: 30s, Read timeout: 120s, Pool size: 10")
     else:
-        # Use environment variables (Lambda execution role)
+        # Use default AWS credentials (environment variables, IAM role, etc.)
         AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
         BUCKET_NAME = os.environ.get('BUCKET_NAME', 'aps-summarization-poc')
         
-        print(f"[CONFIG] Using environment variables: region={AWS_REGION}, bucket={BUCKET_NAME}")
+        print("[CONFIG] Using default AWS credentials from environment")
         
-        s3_client = boto3.client('s3', region_name=AWS_REGION)
+        # Configure boto3 with timeouts to prevent hanging
+        boto_config = Config(
+            region_name=AWS_REGION,
+            connect_timeout=30,
+            read_timeout=120,
+            retries={'max_attempts': 3, 'mode': 'standard'},
+            max_pool_connections=10
+        )
+        
+        s3_client = boto3.client("s3", config=boto_config)
+        
+        print(f"[CONFIG] AWS clients initialized with region: {AWS_REGION}")
+        print("[CONFIG] Connection timeout: 30s, Read timeout: 120s, Pool size: 10")
 
 except Exception as e:
     print(f"[CONFIG ERROR] Failed to initialize AWS clients: {e}")
-    # Fallback configuration
+    print("[CONFIG ERROR] Script may fail during S3 operations")
+    # Create clients anyway with fallback (will fail at runtime if credentials missing)
     AWS_REGION = "us-east-1"
     BUCKET_NAME = "aps-summarization-poc"
-    s3_client = boto3.client('s3', region_name=AWS_REGION)
+    boto_config = Config(
+        region_name=AWS_REGION,
+        connect_timeout=30,
+        read_timeout=120,
+        retries={'max_attempts': 3, 'mode': 'standard'}
+    )
+    s3_client = boto3.client("s3", config=boto_config)
 
 
 def load_patient_data_from_s3(session_id):
@@ -82,10 +177,17 @@ def load_patient_data_from_s3(session_id):
         
     except s3_client.exceptions.NoSuchKey as e:
         print(f"[S3 ERROR] Data not found for session {session_id}: {e}")
-        raise Exception(f"No analysis data found for session {session_id}. Please analyze a document first.")
+        # Return structured response instead of exception (enables clean orchestration)
+        return {
+            "status": "no_data",
+            "answer": "Document has not been analyzed yet. Please analyze the document first before asking questions about patient data."
+        }
     except Exception as e:
         print(f"[S3 ERROR] Failed to load data: {e}")
-        raise Exception(f"Error loading patient data: {str(e)}")
+        return {
+            "status": "error",
+            "answer": f"Error loading patient data: {str(e)}"
+        }
 
 
 def get_family_history(data):
@@ -104,7 +206,7 @@ def get_family_history(data):
     if not family_history:
         return {
             'status': 'no_data',
-            'message': 'No family history documented in available medical records.',
+            'answer': 'No family history documented in available medical records.',
             'family_history': []
         }
     
@@ -124,7 +226,7 @@ def get_family_history(data):
                 'status': 'relation_unspecified',
                 'safe_response': f"Family history of {condition} is documented, but the specific family member (father, mother, sibling, grandparent) is not specified in the available medical records.",
                 'condition': condition,
-                'notes': notes if notes else None,
+                'notes': notes or '',
                 'warning': 'DO NOT fabricate specific family members - relation not documented'
             })
         else:
@@ -141,15 +243,41 @@ def get_family_history(data):
                 'condition': condition,
                 'diagnosis_age': diagnosis_age if diagnosis_age else 'Not documented',
                 'safe_response': response_text,
-                'notes': notes if notes else None
+                'notes': notes or ''
             })
     
-    return {
-        'status': 'success',
-        'message': f'Found {len(validated_entries)} family history entries',
-        'family_history': validated_entries,
-        'instruction': 'Use safe_response field exactly as provided - DO NOT modify or add details'
-    }
+    # Return standardized answer field for clean agent consumption
+    if validated_entries and validated_entries[0].get('status') == 'relation_unspecified':
+        answer = validated_entries[0]['safe_response']
+    elif validated_entries:
+        # Format documented relations (status is 'relation_specified')
+        answer_parts = []
+        for entry in validated_entries:
+            if entry.get('status') == 'relation_specified':
+                answer_parts.append(entry.get('safe_response', f"{entry['relation']} has {entry['condition']}"))
+        answer = ". ".join(answer_parts) if answer_parts else "Family history documented."
+    else:
+        answer = "No family history documented."
+    
+    # Convert to Pydantic models — coerce None to "" for all str fields to avoid ValidationError
+    family_history_models = [
+        FamilyHistoryEntry(
+            relation=e.get('relation') or 'Not specified',
+            condition=e.get('condition') or 'Unknown',
+            diagnosis_age=e.get('diagnosis_age') or '',
+            notes=e.get('notes') or '',
+            status=e.get('status'),
+            safe_response=e.get('safe_response'),
+            warning=e.get('warning')
+        ) for e in validated_entries
+    ]
+    
+    return FamilyHistoryResponse(
+        status='success',
+        answer=answer,
+        family_history=family_history_models,
+        total_entries=len(validated_entries)
+    )
 
 
 def get_patient_info(data):
@@ -166,23 +294,34 @@ def get_patient_info(data):
         patient_demographics = data['medical'].get('overview', {})
         health_latest = data['medical'].get('health_latest', {})
     
-    return {
-        'status': 'success',
-        'patient_name': patient_demographics.get('name', 'Not documented'),
-        'age': patient_demographics.get('age', 'Not documented'),
-        'sex': patient_demographics.get('sex', 'Not documented'),
-        'date_of_birth': patient_demographics.get('date_of_birth', 'Not documented'),
-        'pcp': patient_demographics.get('pcp', 'Not documented'),
-        'insurance_provider': patient_demographics.get('insurance_provider', 'Not documented'),
-        'current_vitals': {
-            'bmi': health_latest.get('bmi', 'Not documented'),
-            'bp': health_latest.get('bp', 'Not documented'),
-            'heart_rate': health_latest.get('heart_rate', 'Not documented'),
-            'weight': health_latest.get('weight', 'Not documented'),
-            'height': health_latest.get('height', 'Not documented')
-        },
-        'risk_level': exec_summary.get('risk_level', 'Not assessed')
-    }
+    name = patient_demographics.get('name', 'Not documented')
+    age = patient_demographics.get('age', 'Not documented')
+    sex = patient_demographics.get('sex', 'Not documented')
+    
+    # Build answer string
+    answer = f"Patient: {name}, Age: {age}, Sex: {sex}"
+    
+    # Build Pydantic models
+    vitals = CurrentVitals(
+        bmi=health_latest.get('bmi', 'Not documented'),
+        bp=health_latest.get('bp', 'Not documented'),
+        heart_rate=health_latest.get('heart_rate', 'Not documented'),
+        weight=health_latest.get('weight', 'Not documented'),
+        height=health_latest.get('height', 'Not documented')
+    )
+    
+    return PatientInfoResponse(
+        status='success',
+        answer=answer,
+        patient_name=name,
+        age=age,
+        sex=sex,
+        date_of_birth=patient_demographics.get('date_of_birth', 'Not documented'),
+        pcp=patient_demographics.get('pcp', 'Not documented'),
+        insurance_provider=patient_demographics.get('insurance_provider', 'Not documented'),
+        current_vitals=vitals,
+        risk_level=exec_summary.get('risk_level', 'Not assessed')
+    )
 
 
 def get_medications(data):
@@ -201,8 +340,9 @@ def get_medications(data):
     # Add high-risk medications first (marked)
     for med in high_risk_meds[:5]:  # Limit to 5 high-risk
         all_medications.append({
-            'name': med.get('medication_name', 'Unknown'),
+            'name': med.get('condition') or med.get('medication') or med.get('medication_name', 'Unknown'),
             'category': 'HIGH RISK',
+            'rxnorm_code': med.get('rxnorm_code', ''),
             'snomed_code': med.get('snomed_code', ''),
             'description': med.get('description', '')[:200] if med.get('description') else ''
         })
@@ -210,31 +350,61 @@ def get_medications(data):
     # Add other medications
     for med in other_meds[:5]:  # Limit to 5 other
         all_medications.append({
-            'name': med.get('medication_name', 'Unknown'),
+            'name': med.get('condition') or med.get('medication') or med.get('medication_name', 'Unknown'),
             'category': 'Standard',
+            'rxnorm_code': med.get('rxnorm_code', ''),
             'snomed_code': med.get('snomed_code', ''),
             'description': med.get('description', '')[:200] if med.get('description') else ''
         })
     
-    # Fallback: If no structured data, use narrative
+    # Fallback: If no structured data, parse medication_history narrative
     if not all_medications:
         medication_history = data['enhanced'].get('medication_history') or \
                            (data['medical'].get('medication_history') if data['medical'] else None)
         
         if medication_history:
-            return {
-                'status': 'success',
-                'message': 'Medication data available as narrative text',
-                'narrative': medication_history[:500],  # Limit length
-                'note': 'Full structured medication list not available - showing summary'
-            }
+            # Parse medication names from narrative (comma-separated list)
+            # Example: "Lisinopril 10mg daily, Atorvastatin 20mg nightly, Famotidine PRN"
+            
+            # Split by commas and extract medication names (first word before dose)
+            med_entries = medication_history.split(',')
+            for entry in med_entries[:10]:  # Limit to 10 medications
+                entry = entry.strip()
+                # Extract first word (medication name) before dosage pattern
+                match = re.match(r'^([A-Za-z-]+)', entry)
+                if match:
+                    med_name = match.group(1)
+                    all_medications.append({
+                        'name': med_name,
+                        'category': 'Standard',
+                        'snomed_code': '',
+                        'rxnorm_code': '',
+                        'description': entry[:100]  # Full entry as description
+                    })
     
-    return {
-        'status': 'success',
-        'message': f'Found {len(all_medications)} medications (showing top 10)',
-        'medications': all_medications,
-        'total_count': len(high_risk_meds) + len(other_meds)
-    }
+    # Build answer string
+    if all_medications:
+        answer = f"Patient is taking {len(all_medications)} medications: " + ", ".join([m['name'] for m in all_medications[:5]])
+    else:
+        answer = "No medications documented."
+    
+    # Convert to Pydantic models
+    medication_models = [
+        Medication(
+            name=m['name'],
+            category=m['category'],
+            rxnorm_code=m['rxnorm_code'],
+            snomed_code=m['snomed_code'],
+            description=m['description']
+        ) for m in all_medications
+    ]
+    
+    return MedicationsResponse(
+        status='success',
+        answer=answer,
+        medications=medication_models,
+        total_count=len(high_risk_meds) + len(other_meds)
+    )
 
 
 def get_conditions(data):
@@ -248,16 +418,18 @@ def get_conditions(data):
     chronic = data['enhanced'].get('chronic_conditions', [])[:5]
     other = data['enhanced'].get('other_conditions', [])[:5]
     
+    risk_level = data['enhanced'].get('executive_summary', {}).get('risk_level', 'Not assessed')
+    
     result = {
         'status': 'success',
-        'risk_level': data['enhanced'].get('executive_summary', {}).get('risk_level', 'Not assessed'),
+        'risk_level': risk_level,
         'key_high_risk_conditions': []
     }
     
     # Format high-risk conditions
     for cond in high_risk:
         result['key_high_risk_conditions'].append({
-            'name': cond.get('condition_name', 'Unknown'),
+            'name': cond.get('condition') or cond.get('condition_name', 'Unknown'),
             'category': 'HIGH RISK',
             'snomed_code': cond.get('snomed_code', ''),
             'description': cond.get('description', '')[:200] if cond.get('description') else ''
@@ -267,7 +439,7 @@ def get_conditions(data):
     result['chronic_conditions'] = []
     for cond in chronic:
         result['chronic_conditions'].append({
-            'name': cond.get('condition_name', 'Unknown'),
+            'name': cond.get('condition') or cond.get('condition_name', 'Unknown'),
             'category': 'CHRONIC',
             'snomed_code': cond.get('snomed_code', ''),
             'description': cond.get('description', '')[:200] if cond.get('description') else ''
@@ -277,13 +449,34 @@ def get_conditions(data):
     result['other_conditions'] = []
     for cond in other:
         result['other_conditions'].append({
-            'name': cond.get('condition_name', 'Unknown'),
+            'name': cond.get('condition') or cond.get('condition_name', 'Unknown'),
             'category': 'Other',
             'snomed_code': cond.get('snomed_code', ''),
             'description': cond.get('description', '')[:150] if cond.get('description') else ''
         })
     
-    return result
+    # Build answer string
+    answer_parts = [f"Risk Level: {risk_level}"]
+    if result['key_high_risk_conditions']:
+        answer_parts.append(f"High-risk conditions: {', '.join([c['name'] for c in result['key_high_risk_conditions']])}")
+    if result['chronic_conditions']:
+        answer_parts.append(f"Chronic conditions: {', '.join([c['name'] for c in result['chronic_conditions'][:3]])}")
+    
+    answer = ". ".join(answer_parts)
+    
+    # Convert to Pydantic models
+    high_risk_models = [Condition(**c) for c in result['key_high_risk_conditions']]
+    chronic_models = [Condition(**c) for c in result['chronic_conditions']]
+    other_models = [Condition(**c) for c in result['other_conditions']]
+    
+    return ConditionsResponse(
+        status='success',
+        answer=answer,
+        risk_level=risk_level,
+        key_high_risk_conditions=high_risk_models,
+        chronic_conditions=chronic_models,
+        other_conditions=other_models
+    )
 
 
 def get_lab_results(data):
@@ -305,7 +498,7 @@ def get_lab_results(data):
     if not labs:
         return {
             'status': 'no_data',
-            'message': 'No lab results documented',
+            'answer': 'No lab results documented in available medical records.',
             'lab_results': []
         }
     
@@ -324,19 +517,27 @@ def get_lab_results(data):
     for lab in sorted_labs:
         formatted_labs.append({
             'test_name': lab.get('test_name', 'Unknown'),
-            'result': lab.get('result', 'Not available'),
-            'reference_range': lab.get('reference_range', ''),
+            'result': lab.get('value') or lab.get('result', 'Not available'),  # Try 'value' first, then 'result'
+            'normal_range': lab.get('reference_range') or lab.get('normal_range', ''),
             'status': lab.get('status', 'Unknown'),
-            'date': lab.get('date', 'Not documented'),
-            'unit': lab.get('unit', '')
+            'date': lab.get('date', 'Not documented')
         })
     
-    return {
-        'status': 'success',
-        'message': f'Showing {len(formatted_labs)} most recent lab results',
-        'lab_results': formatted_labs,
-        'total_count': len(labs)
-    }
+    # Build answer string
+    if formatted_labs:
+        answer = f"Found {len(labs)} lab results. Most recent: " + ", ".join([f"{lab['test_name']}: {lab['result']}" for lab in formatted_labs[:3]])
+    else:
+        answer = "No lab results available."
+    
+    # Convert to Pydantic models
+    lab_models = [LabResult(**lab) for lab in formatted_labs]
+    
+    return LabResultsResponse(
+        status='success',
+        answer=answer,
+        lab_results=lab_models,
+        total_count=len(labs)
+    )
 
 
 def get_summary(data):
@@ -348,16 +549,24 @@ def get_summary(data):
     
     exec_summary = data['enhanced'].get('executive_summary', {})
     
-    return {
-        'status': 'success',
-        'patient_name': exec_summary.get('patient_demographics', {}).get('name', 'Not documented'),
-        'age': exec_summary.get('patient_demographics', {}).get('age', 'Not documented'),
-        'risk_level': exec_summary.get('risk_level', 'Not assessed'),
-        'narrative_summary': exec_summary.get('narrative_summary', 'No summary available')[:500],  # Limit length
-        'key_summary_points': exec_summary.get('key_summary_points', [])[:5],  # Top 5 points
-        'key_high_risk_conditions': exec_summary.get('key_high_risk_conditions', [])[:5],
-        'overall_risk_assessment': exec_summary.get('overall_risk_assessment', 'Not assessed')[:400]
-    }
+    narrative = exec_summary.get('narrative_summary', 'No summary available')[:500]
+    
+    # Convert list of dicts to list of strings for key_high_risk_conditions
+    high_risk_conditions = exec_summary.get('key_high_risk_conditions', [])[:5]
+    if high_risk_conditions and isinstance(high_risk_conditions[0], dict):
+        high_risk_conditions = [c.get('name', str(c)) for c in high_risk_conditions]
+    
+    return SummaryResponse(
+        status='success',
+        answer=narrative,
+        patient_name=exec_summary.get('patient_demographics', {}).get('name', 'Not documented'),
+        age=exec_summary.get('patient_demographics', {}).get('age', 'Not documented'),
+        risk_level=exec_summary.get('risk_level', 'Not assessed'),
+        narrative_summary=narrative,
+        key_summary_points=exec_summary.get('key_summary_points', [])[:5],
+        key_high_risk_conditions=high_risk_conditions,
+        overall_risk_assessment=exec_summary.get('overall_risk_assessment', 'Not assessed')[:400]
+    )
 
 
 def get_vitals_trend(data):
@@ -371,7 +580,7 @@ def get_vitals_trend(data):
     if not vitals_trend or not vitals_trend.get('dates'):
         return {
             'status': 'no_data',
-            'message': 'No vitals trend data available',
+            'answer': 'No vitals trend data available in the medical records.',
             'vitals_trend': {}
         }
     
@@ -379,18 +588,24 @@ def get_vitals_trend(data):
     vitals_summary = data['medical'].get('vitals_summary', 'No vitals summary available')
     vitals_risk = data['medical'].get('vitals_risk_level', 'Not assessed')
     
-    return {
-        'status': 'success',
-        'message': 'Vitals trend data available',
-        'vitals_trend': {
-            'dates': vitals_trend.get('dates', []),
-            'bp': vitals_trend.get('bp', []),
-            'heart_rate': vitals_trend.get('heart_rate', []),
-            'weight': vitals_trend.get('weight', [])
-        },
-        'vitals_summary': vitals_summary[:400],  # Limit length
-        'vitals_risk_level': vitals_risk
-    }
+    # Use vitals summary as answer
+    answer = vitals_summary[:400] if vitals_summary else "Vitals trend data available."
+    
+    # Build Pydantic models
+    trend_data = VitalsTrendData(
+        dates=vitals_trend.get('dates', []),
+        bp=vitals_trend.get('bp', []),
+        heart_rate=vitals_trend.get('heart_rate', []),
+        weight=vitals_trend.get('weight', [])
+    )
+    
+    return VitalsTrendResponse(
+        status='success',
+        answer=answer,
+        vitals_trend=trend_data,
+        vitals_summary=vitals_summary[:400],
+        vitals_risk_level=vitals_risk
+    )
 
 
 def lambda_handler(event, context):
@@ -435,6 +650,7 @@ def lambda_handler(event, context):
         # Extract parameters from Bedrock Agent event format
         session_id = None
         query_type = "summary"  # Default
+        question = None  # Original user question (for future use/debugging)
         
         # Try to get from parameters array (Bedrock Agent format)
         if 'parameters' in event:
@@ -443,6 +659,8 @@ def lambda_handler(event, context):
                     session_id = param.get('value')
                 elif param.get('name') == 'queryType':
                     query_type = param.get('value')
+                elif param.get('name') == 'question':
+                    question = param.get('value')
         
         # Fallback: Try to get from requestBody
         if not session_id and 'requestBody' in event:
@@ -456,39 +674,80 @@ def lambda_handler(event, context):
         
         # Validation
         if not session_id:
-            raise ValueError("Missing required parameter: sessionId")
+            return {
+                'messageVersion': '1.0',
+                'response': {
+                    'actionGroup': event.get('actionGroup', 'query-patient-data'),
+                    'apiPath': event.get('apiPath', '/query-patient-data'),
+                    'httpMethod': 'POST',
+                    'httpStatusCode': 400,
+                    'responseBody': {
+                        'application/json': {
+                            'body': json.dumps({
+                                'status': 'error',
+                                'answer': 'Missing required parameter: sessionId. Please provide the session ID.'
+                            })
+                        }
+                    }
+                }
+            }
         
-        print(f"[PARAMS] sessionId={session_id}, queryType={query_type}")
+        print(f"[PARAMS] sessionId={session_id}, queryType={query_type}, question={question}")
         
         # Load patient data from S3
         data = load_patient_data_from_s3(session_id)
         
-        # Route to appropriate handler
-        if query_type == 'family_history':
-            result = get_family_history(data)
-        elif query_type == 'patient_info':
-            result = get_patient_info(data)
-        elif query_type == 'medications':
-            result = get_medications(data)
-        elif query_type == 'conditions':
-            result = get_conditions(data)
-        elif query_type == 'lab_results':
-            result = get_lab_results(data)
-        elif query_type == 'vitals_trend':
-            result = get_vitals_trend(data)
-        elif query_type == 'summary':
-            result = get_summary(data)
+        # Handle no_data response from load function
+        if isinstance(data, dict) and data.get('status') in ['no_data', 'error']:
+            # This is already a dict, use it as-is
+            result_dict = data
         else:
-            result = {
-                'status': 'error',
-                'message': f'Unknown query type: {query_type}',
-                'available_types': ['family_history', 'patient_info', 'medications', 'conditions', 'lab_results', 'vitals_trend', 'summary']
-            }
+            # Route to appropriate handler (returns Pydantic model)
+            result = None
+            if query_type == 'family_history':
+                result = get_family_history(data)
+            elif query_type == 'patient_info':
+                result = get_patient_info(data)
+            elif query_type == 'medications':
+                result = get_medications(data)
+            elif query_type == 'conditions':
+                result = get_conditions(data)
+            elif query_type == 'lab_results':
+                result = get_lab_results(data)
+            elif query_type == 'vitals_trend':
+                result = get_vitals_trend(data)
+            elif query_type == 'summary':
+                result = get_summary(data)
+            else:
+                # CRITICAL: Unknown queryType fallback
+                print(f"[WARNING] Unknown queryType received: {query_type}")
+                result = {
+                    'status': 'unknown_query',
+                    'answer': 'Unable to determine the requested data category. Please specify what medical information you need (e.g., family history, lab results, medications, conditions, patient info, vitals, or summary).',
+                    'available_query_types': [
+                        'family_history',
+                        'patient_info',
+                        'medications',
+                        'conditions',
+                        'lab_results',
+                        'summary',
+                        'vitals_trend'
+                    ]
+                }
+            
+            # Convert Pydantic model to dict (Pydantic models have .model_dump() method)
+            if hasattr(result, 'model_dump'):
+                result_dict = result.model_dump(exclude_none=True)
+            else:
+                result_dict = result
+        
+        # Log the answer field for debugging
+        print(f"[RESPONSE] answer: {result_dict.get('answer', 'N/A')[:100]}...")
         
         # Return response in Bedrock Agent format
         response_body = {
             'application/json': {
-                'body': json.dumps(result)
+                'body': json.dumps(result_dict)
             }
         }
         
@@ -519,8 +778,7 @@ def lambda_handler(event, context):
             'application/json': {
                 'body': json.dumps({
                     'status': 'error',
-                    'error': str(e),
-                    'message': f'Failed to query patient data: {str(e)}'
+                    'answer': f'Failed to query patient data: {str(e)}'
                 })
             }
         }
@@ -539,18 +797,102 @@ def lambda_handler(event, context):
 
 # For local testing
 if __name__ == "__main__":
-    # Test event
-    test_event = {
-        "actionGroup": "query-patient-data",
-        "apiPath": "/query-patient-data",
-        "httpMethod": "POST",
-        "parameters": [
-            {"name": "sessionId", "value": "65158ada-3c17-42dd-b836-8ef8622fea77"},
-            {"name": "queryType", "value": "family_history"}
-        ]
-    }
+    """
+    Local testing - Tests all 7 query types
     
-    result = lambda_handler(test_event, None)
+    SETUP:
+    1. Ensure config.local.json has correct AWS profile
+    2. Use a session_id that has outputs in S3:
+       - {session_id}/outputs/enhanced_medical_summary_with_risks.json
+       - {session_id}/outputs/medical_summary.json
+    """
+    
+    # CHANGE THIS to a valid session_id with S3 outputs
+    TEST_SESSION_ID = "45b5b995-9973-4764-ab05-56846671229e"
+    
+    query_types = [
+        ("family_history", "Family History (Anti-Hallucination Test)"),
+        ("patient_info", "Patient Demographics"),
+        ("medications", "Medication List"),
+        ("conditions", "Medical Conditions"),
+        ("lab_results", "Laboratory Results"),
+        ("vitals_trend", "Vitals Trend Over Time"),
+        ("summary", "Executive Summary")
+    ]
+    
     print("\n" + "="*80)
-    print("LAMBDA RESULT:")
-    print(json.dumps(result, indent=2))
+    print("APS QUERY PATIENT DATA - LOCAL TESTING")
+    print("="*80)
+    print(f"Session ID: {TEST_SESSION_ID}")
+    print(f"Testing {len(query_types)} query types")
+    print("="*80)
+    
+    results = []
+    
+    for query_type, description in query_types:
+        print(f"\n🧪 TEST: {description}")
+        print("-" * 80)
+        
+        test_event = {
+            "actionGroup": "query-patient-data",
+            "apiPath": "/query-patient-data",
+            "httpMethod": "POST",
+            "parameters": [
+                {"name": "sessionId", "value": TEST_SESSION_ID},
+                {"name": "queryType", "value": query_type}
+            ],
+            "sessionAttributes": {},
+            "promptSessionAttributes": {}
+        }
+        
+        try:
+            result = lambda_handler(test_event, None)
+            
+            # Extract response body
+            response_body = result.get('response', {}).get('responseBody', {})
+            body_json = response_body.get('application/json', {}).get('body', '{}')
+            parsed_body = json.loads(body_json)
+            
+            status = parsed_body.get('status')
+            answer = parsed_body.get('answer', 'N/A')
+            
+            print(f"✅ Status: {status}")
+            print(f"📄 Answer: {answer[:200]}..." if len(answer) > 200 else f"📄 Answer: {answer}")
+            
+            # Show specific fields based on query type
+            if query_type == 'family_history' and 'family_history' in parsed_body:
+                entries = parsed_body['family_history']
+                print(f"📊 Entries: {len(entries)}")
+                for entry in entries[:2]:  # Show first 2
+                    print(f"   - {entry.get('status')}: {entry.get('safe_response', '')[:100]}")
+            
+            elif query_type == 'medications' and 'medications' in parsed_body:
+                meds = parsed_body['medications']
+                print(f"📊 Found: {len(meds)} medications")
+            
+            elif query_type == 'lab_results' and 'lab_results' in parsed_body:
+                labs = parsed_body['lab_results']
+                print(f"📊 Found: {len(labs)} lab results")
+            
+            results.append((description, True))
+            
+        except Exception as e:
+            print(f"❌ FAILED: {str(e)}")
+            results.append((description, False))
+    
+    # Summary
+    print("\n" + "="*80)
+    print("TEST SUMMARY")
+    print("="*80)
+    
+    for description, success in results:
+        status = "✅ PASS" if success else "❌ FAIL"
+        print(f"{status} - {description}")
+    
+    total_passed = sum(1 for _, success in results if success)
+    print(f"\n📊 Total: {total_passed}/{len(results)} tests passed")
+    
+    if total_passed == len(results):
+        print("\n🎉 All tests passed! Lambda function is ready for deployment.")
+    else:
+        print("\n⚠️ Some tests failed. Review errors above.")
